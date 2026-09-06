@@ -555,12 +555,15 @@ async function createGoogleMeet(): Promise<string> {
   const accessToken = await getGoogleAccessToken();
   let response = await createGoogleMeetSpace(accessToken, true);
   if (!response.ok) {
-    console.warn("Google Meet auto-transcription setup failed; creating the meeting without it", { status: response.status });
+    console.warn("Google Meet auto-transcription setup failed; creating the meeting without it", {
+      status: response.status,
+      error: await getGoogleApiErrorMessage(response),
+    });
     response = await createGoogleMeetSpace(accessToken, false);
   }
 
   if (!response.ok) {
-    throw new Error(`Google Meet API returned HTTP ${response.status}`);
+    throw new Error(`Google Meet API returned HTTP ${response.status}: ${await getGoogleApiErrorMessage(response) ?? "unknown error"}`);
   }
 
   const payload = (await response.json()) as GoogleMeetSpace;
@@ -602,6 +605,17 @@ function createGoogleMeetSpace(accessToken: string, enableAutoTranscription: boo
       config,
     }),
   });
+}
+
+async function getGoogleApiErrorMessage(response: Response): Promise<string | undefined> {
+  try {
+    const body = (await response.clone().json()) as { error?: { message?: unknown; status?: unknown } };
+    const message = typeof body.error?.message === "string" ? body.error.message : undefined;
+    const status = typeof body.error?.status === "string" ? body.error.status : undefined;
+    return [status, message].filter(Boolean).join(": ") || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 async function trackMeetingForSummary(spaceName: string): Promise<void> {
