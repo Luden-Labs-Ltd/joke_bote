@@ -17,6 +17,8 @@ npm run dev
 - `BOT_TOKEN` — токен из BotFather.
 - `TARGET_CHAT_IDS` — необязательный первоначальный список id групп через запятую.
 - `MEETING_SUBSCRIPTIONS_FILE` — путь к постоянному файлу подписок групп. На Railway используйте `/data/meeting-subscriptions.json` и подключите Volume в `/data`.
+- `MEETING_SUMMARY_FILE` — путь к состоянию ожидающих итогов Meet. На Railway используйте `/data/meeting-summaries.json` в том же Volume.
+- `MEETING_SUMMARY_CHAT_IDS` — id групп Telegram через запятую, куда отправлять итоги созвонов.
 - `MEETING_URL` — запасная ссылка Google Meet, если доступ Google временно недоступен.
 - `MEETING_MESSAGE` — текст перед ссылкой, необязательно.
 - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN` — OAuth-данные Google с разрешением `https://www.googleapis.com/auth/meetings.space.created`.
@@ -28,6 +30,8 @@ npm run dev
 ```env
 TARGET_CHAT_IDS=-1001234567890,-1009876543210
 MEETING_SUBSCRIPTIONS_FILE=/data/meeting-subscriptions.json
+MEETING_SUMMARY_FILE=/data/meeting-summaries.json
+MEETING_SUMMARY_CHAT_IDS=-1001234567890
 MEETING_URL=https://meet.google.com/abc-defg-hij
 ```
 
@@ -36,6 +40,10 @@ MEETING_URL=https://meet.google.com/abc-defg-hij
 ## Новая ссылка Google Meet
 
 Команда `/newmeet` доступна администраторам рабочей группы: она создаёт отдельный открытый Google Meet и сразу отправляет ссылку в чат. Любой человек со ссылкой сможет подключиться без подтверждения организатора. При заполненных OAuth-переменных автоматические рассылки с понедельника по четверг тоже создают новую открытую ссылку для каждого созвона. Без них бот использует `MEETING_URL`.
+
+## Итоги созвонов
+
+Для новых Meet-ссылок бот запрашивает автотранскрипцию. Когда расшифровка готова, бот получает её через Meet API, делает в Gemini короткий итог с решениями и задачами и отправляет его в `MEETING_SUMMARY_CHAT_IDS`. Если транскрипция недоступна для Google-аккаунта или тарифа, ссылка на Meet всё равно создаётся, но итог не будет отправлен. Для надёжности подключения групп и ожидания итогов подключите Railway Volume в `/data`.
 
 ## Уведомления о коммитах GitHub
 
