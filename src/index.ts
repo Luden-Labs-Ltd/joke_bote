@@ -1,190 +1,73 @@
 import dotenv from "dotenv";
-import { Telegraf } from "telegraf";
+import { Context, Telegraf } from "telegraf";
 
 dotenv.config();
 
 const token = process.env.BOT_TOKEN;
-const geminiApiKey = process.env.GEMINI_API_KEY;
-const geminiModel = process.env.GEMINI_MODEL ?? "gemini-3.1-flash-lite";
 
 if (!token) {
   throw new Error("BOT_TOKEN is required");
 }
 
-const targetUserIds = new Set(
-  (process.env.TARGET_USER_IDS ?? "")
-    .split(",")
-    .map((value) => value.trim())
-    .filter(Boolean)
-    .map((value) => Number(value))
-    .filter((value) => Number.isInteger(value) && value > 0),
-);
-
-const roastCooldownMs = parsePositiveInt(process.env.ROAST_COOLDOWN_MS, 3 * 60 * 1000);
-const replyChancePercent = clamp(parsePositiveInt(process.env.REPLY_CHANCE_PERCENT, 35), 1, 100);
-const maxContextMessages = 12;
-
-const aiFallbackLine = "Сегодня даже нейросеть взяла паузу. Считай, это редкий комплимент.";
+const meetingUrl = process.env.MEETING_URL?.trim();
+const googleClientId = process.env.GOOGLE_CLIENT_ID?.trim();
+const googleClientSecret = process.env.GOOGLE_CLIENT_SECRET?.trim();
+const googleRefreshToken = process.env.GOOGLE_REFRESH_TOKEN?.trim();
+const targetChatIds = parseChatIds(process.env.TARGET_CHAT_IDS);
+const meetingMessage = process.env.MEETING_MESSAGE?.trim() || "Созвон начинаем в 10:30 МСК. Ссылка на Google Meet:";
+const meetingDays = new Set([2, 4]);
+const meetingHourMoscow = 10;
+const meetingMinuteMoscow = 30;
+const moscowUtcOffsetHours = 3;
 
 const helpText = [
-  "/start - краткая справка",
-  "/help - список команд",
-  "/id - показать user_id и chat_id",
-  "/roastme - получить шутку про себя",
-  "/joke - получить случайную шутку",
-  "/dag - интересный факт про Дагестан",
+  "Я manager-бот: по вторникам и четвергам в 10:30 МСК присылаю ссылку на общий созвон.",
   "",
-  "Для реакций в группе:",
-  "1. Добавь бота в группу",
-  "2. Выключи Privacy Mode через BotFather",
-  "3. При желании задай TARGET_USER_IDS через .env",
+  "/chatid — показать id этой группы для TARGET_CHAT_IDS",
+  "/newmeet — создать новую ссылку Google Meet (для администратора группы)",
+  "/help — эта справка",
 ].join("\n");
 
 const bot = new Telegraf(token);
-const lastReplyAtByChat = new Map<number, number>();
-const recentMessagesByChat = new Map<number, Array<{ username: string; text: string }>>();
-const geminiSystemPrompt = [
-  "Ты пишешь на русском.",
-  "Сгенерируй одну короткую, дерзкую, смешную и добродушную реплику для чата друзей 18-25 лет.",
-  "Стиль: современный Telegram-юмор, наблюдательный стёб, быстрый панчлайн, без канцелярита и дедовского пафоса.",
-  "Шутка должна цепляться за конкретную деталь из контекста, а не быть общей фразой.",
-  "Используй сленг редко и только если он реально звучит естественно.",
-  "Не используй слова кринж, база, минус вайб чаще одного раза за ответ и не используй emoji 🤡.",
-  "Не уходи в длинные философские метафоры про мироздание, архивы, бездну, истинных воинов и прочий тяжёлый пафос.",
-  "Пиши как живой человек в Telegram: коротко, с подколом, иногда с лёгкой наглостью.",
-  "Подкол должен быть понятен людям до 25 лет и звучать как сообщение в дружеском чате.",
-  "Используй максимум 1 emoji и только если он усиливает шутку.",
-  "У тебя есть контекст последних сообщений чата, используй его как фон разговора.",
-  "Шути только по теме диалога, без выбора конкретной жертвы.",
-  "Не используй оскорбления, угрозы, хейт, мат, сексуальный контент, темы внешности, здоровья, расы, религии или унижения.",
-  "Отвечай одной фразой длиной до 18 слов.",
-  "Верни только готовую реплику без markdown, списков, заголовков, кавычек, пояснений и префиксов вроде Context или Ответ.",
-].join(" ");
 
-console.log("Bot config loaded", {
+console.log("Manager bot config loaded", {
   botUsername: process.env.BOT_USERNAME || null,
-  hasBotToken: Boolean(token),
-  hasGeminiApiKey: Boolean(geminiApiKey),
-  geminiModel,
-  targetUserIdsCount: targetUserIds.size,
-  roastCooldownMs,
-  replyChancePercent,
-  maxContextMessages,
+  targetChatIdsCount: targetChatIds.size,
+  hasMeetingUrl: Boolean(meetingUrl),
+  hasGoogleMeetAccess: hasGoogleMeetAccess(),
+  schedule: "Tuesday and Thursday, 10:30 Europe/Moscow",
 });
 
 bot.start((ctx) => ctx.reply(helpText));
 bot.help((ctx) => ctx.reply(helpText));
 
-bot.command("id", async (ctx) => {
-  console.log("ID command requested", {
-    chat: getChatLogInfo(ctx.chat),
-    from: getUserLogInfo(ctx.from),
-    messageId: ctx.message.message_id,
-  });
-
+bot.command("chatid", async (ctx) => {
+  console.log("Chat ID requested", getChatLogInfo(ctx.chat));
   await ctx.reply(
     [
-      `user_id: ${ctx.from.id}`,
-      `username: ${ctx.from.username ? `@${ctx.from.username}` : "none"}`,
       `chat_id: ${ctx.chat.id}`,
       `chat_type: ${ctx.chat.type}`,
+      ctx.chat.type === "private"
+        ? "Добавьте бота в нужную группу и вызовите там /chatid."
+        : "Добавьте это значение в TARGET_CHAT_IDS в .env.",
     ].join("\n"),
   );
 });
 
-bot.command("joke", async (ctx) => {
-  const chatId = ctx.chat.id;
-
-  await ctx.reply(
-    await generateAiJoke({
-      mode: ctx.chat.type === "group" || ctx.chat.type === "supergroup" ? "group" : "general",
-      chatContext: recentMessagesByChat.get(chatId) ?? [],
-    }),
-  );
-});
-
-bot.command("roastme", async (ctx) => {
-  await ctx.reply(
-    await generateAiJoke({
-      mode: "self",
-      username: ctx.from.username,
-    }),
-  );
-});
-
-bot.command("dag", async (ctx) => {
-  await ctx.reply(
-    await generateAiJoke({
-      mode: "dagestan",
-    }),
-  );
-});
-
-bot.on("text", async (ctx) => {
-  if (!ctx.chat || (ctx.chat.type !== "group" && ctx.chat.type !== "supergroup")) {
+bot.command("newmeet", async (ctx) => {
+  if (!(await isChatAdministrator(ctx))) {
+    await ctx.reply("Эта команда доступна только администраторам группы.");
     return;
   }
 
-  const text = ctx.message.text.trim();
-  if (!text || text.startsWith("/")) {
-    return;
+  try {
+    const url = await createGoogleMeet();
+    await ctx.reply(`${meetingMessage}\n${url}`);
+    console.log("Manual Google Meet created", { chatId: ctx.chat.id, requestedBy: ctx.from?.id ?? null });
+  } catch (error) {
+    console.error("Manual Google Meet creation failed", { chatId: ctx.chat.id, error });
+    await ctx.reply("Не смог создать Google Meet. Проверьте доступ Google в настройках бота.");
   }
-
-  const chatId = ctx.chat.id;
-  console.log("Incoming group message", {
-    chat: getChatLogInfo(ctx.chat),
-    from: getUserLogInfo(ctx.from),
-    messageId: ctx.message.message_id,
-    textPreview: text.slice(0, 120),
-  });
-
-  rememberMessage(chatId, {
-    username: ctx.from.username ?? ctx.from.first_name ?? "unknown",
-    text,
-  });
-
-  const now = Date.now();
-  const lastReplyAt = lastReplyAtByChat.get(chatId) ?? 0;
-
-  if (now - lastReplyAt < roastCooldownMs) {
-    return;
-  }
-
-  const shouldReply = roll(replyChancePercent);
-
-  if (!shouldReply) {
-    return;
-  }
-
-  console.log("Context-aware group joke triggered", {
-    chatId,
-    fromId: ctx.from.id,
-    username: ctx.from.username ?? null,
-    messageId: ctx.message.message_id,
-    textPreview: text.slice(0, 120),
-  });
-
-  const line = await generateAiJoke({
-    mode: "group",
-    messageText: text,
-    username: ctx.from.username,
-    chatContext: recentMessagesByChat.get(chatId) ?? [],
-  });
-  lastReplyAtByChat.set(chatId, now);
-
-  await ctx.reply(line, {
-    reply_parameters: {
-      message_id: ctx.message.message_id,
-    },
-  });
-});
-
-bot.on("new_chat_members", (ctx) => {
-  console.log("New chat members", {
-    chat: getChatLogInfo(ctx.chat),
-    addedBy: getUserLogInfo(ctx.from),
-    members: ctx.message.new_chat_members.map(getUserLogInfo),
-  });
 });
 
 bot.catch((error) => {
@@ -192,196 +75,192 @@ bot.catch((error) => {
 });
 
 bot.launch().then(() => {
-  console.log("Telegram bot is running", {
-    botUsername: process.env.BOT_USERNAME || null,
-  });
+  console.log("Manager bot is running", { botUsername: process.env.BOT_USERNAME || null });
+  scheduleNextMeetingAnnouncement();
 });
 
 process.once("SIGINT", () => bot.stop("SIGINT"));
 process.once("SIGTERM", () => bot.stop("SIGTERM"));
 
-function parsePositiveInt(input: string | undefined, fallback: number): number {
-  const value = Number(input);
-  return Number.isInteger(value) && value > 0 ? value : fallback;
+function scheduleNextMeetingAnnouncement(): void {
+  const nextRunAt = getNextMeetingRunAt(new Date());
+  const delayMs = nextRunAt.getTime() - Date.now();
+
+  console.log("Next meeting announcement scheduled", { nextRunAt: nextRunAt.toISOString(), delayMs });
+
+  setTimeout(async () => {
+    await announceMeeting();
+    scheduleNextMeetingAnnouncement();
+  }, delayMs);
 }
 
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(Math.max(value, min), max);
-}
+function getNextMeetingRunAt(now: Date): Date {
+  const moscowNow = getMoscowDateParts(now);
+  const firstCandidate = new Date(Date.UTC(moscowNow.year, moscowNow.month - 1, moscowNow.day));
 
-function roll(chancePercent: number): boolean {
-  return Math.random() * 100 < chancePercent;
-}
+  for (let offset = 0; offset < 8; offset += 1) {
+    const candidateDate = new Date(firstCandidate);
+    candidateDate.setUTCDate(candidateDate.getUTCDate() + offset);
 
-async function generateAiJoke(input: {
-  mode: "general" | "self" | "group" | "dagestan";
-  messageText?: string;
-  username?: string;
-  chatContext?: Array<{ username: string; text: string }>;
-}): Promise<string> {
-  if (!geminiApiKey) {
-    console.error("Gemini API key is missing");
-    return aiFallbackLine;
+    if (!meetingDays.has(candidateDate.getUTCDay())) {
+      continue;
+    }
+
+    const candidate = new Date(
+      Date.UTC(
+        candidateDate.getUTCFullYear(),
+        candidateDate.getUTCMonth(),
+        candidateDate.getUTCDate(),
+        meetingHourMoscow - moscowUtcOffsetHours,
+        meetingMinuteMoscow,
+      ),
+    );
+
+    if (candidate.getTime() > now.getTime()) {
+      return candidate;
+    }
   }
 
-  const prompt = buildPrompt(input);
-  const requestBody = {
-    system_instruction: {
-      parts: [{ text: geminiSystemPrompt }],
-    },
-    contents: [
-      {
-        parts: [{ text: prompt }],
-      },
-    ],
-    generationConfig: {
-      temperature: 1,
-      maxOutputTokens: 80,
-    },
-  };
+  throw new Error("Could not calculate the next meeting announcement time");
+}
 
-  console.log("Gemini request", {
-    model: geminiModel,
-    mode: input.mode,
-    systemInstruction: geminiSystemPrompt,
-    prompt,
-    requestBody,
-  });
+async function announceMeeting(): Promise<void> {
+  if (targetChatIds.size === 0) {
+    console.warn("Meeting announcement skipped: TARGET_CHAT_IDS is empty");
+    return;
+  }
 
-  const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": geminiApiKey,
-      },
-      body: JSON.stringify(requestBody),
-    },
+  const url = await getMeetingUrlForAnnouncement();
+
+  if (!url) {
+    console.warn("Meeting announcement skipped: no Google Meet access and MEETING_URL is empty");
+    return;
+  }
+
+  const text = `${meetingMessage}\n${url}`;
+  const chatIds = [...targetChatIds];
+  const results = await Promise.allSettled(
+    chatIds.map((chatId) => bot.telegram.sendMessage(chatId, text)),
   );
 
+  results.forEach((result, index) => {
+    const chatId = chatIds[index];
+    if (result.status === "fulfilled") {
+      console.log("Meeting announcement sent", { chatId });
+      return;
+    }
+
+    console.error("Meeting announcement failed", { chatId, error: result.reason });
+  });
+}
+
+async function getMeetingUrlForAnnouncement(): Promise<string | undefined> {
+  if (hasGoogleMeetAccess()) {
+    try {
+      return await createGoogleMeet();
+    } catch (error) {
+      console.error("Scheduled Google Meet creation failed; using fallback link when available", error);
+    }
+  }
+
+  return meetingUrl;
+}
+
+async function createGoogleMeet(): Promise<string> {
+  if (!hasGoogleMeetAccess()) {
+    throw new Error("Google Meet credentials are not configured");
+  }
+
+  const accessToken = await getGoogleAccessToken();
+  const response = await fetch("https://meet.googleapis.com/v2/spaces", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: "{}",
+  });
+
   if (!response.ok) {
-    console.error("Gemini API error", response.status, await response.text());
-    return aiFallbackLine;
+    throw new Error(`Google Meet API returned HTTP ${response.status}`);
   }
 
-  const payload = (await response.json()) as GeminiGenerateContentResponse;
-  const text = payload.candidates?.[0]?.content?.parts
-    ?.map((part) => part.text ?? "")
-    .join(" ")
-    .trim();
-  const sanitizedText = sanitizeAiReply(text);
+  const payload = (await response.json()) as { meetingUri?: string };
+  if (!payload.meetingUri) {
+    throw new Error("Google Meet API did not return a meeting URI");
+  }
 
-  console.log("Gemini response", {
-    model: geminiModel,
-    mode: input.mode,
-    status: response.status,
-    rawText: text ?? null,
-    sanitizedText: sanitizedText || null,
-    finishReason: payload.candidates?.[0]?.finishReason ?? null,
-    usageMetadata: payload.usageMetadata ?? null,
+  return payload.meetingUri;
+}
+
+async function getGoogleAccessToken(): Promise<string> {
+  const body = new URLSearchParams({
+    client_id: googleClientId!,
+    client_secret: googleClientSecret!,
+    refresh_token: googleRefreshToken!,
+    grant_type: "refresh_token",
+  });
+  const response = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
   });
 
-  return sanitizedText || aiFallbackLine;
+  if (!response.ok) {
+    throw new Error(`Google OAuth returned HTTP ${response.status}`);
+  }
+
+  const payload = (await response.json()) as { access_token?: string };
+  if (!payload.access_token) {
+    throw new Error("Google OAuth did not return an access token");
+  }
+
+  return payload.access_token;
 }
 
-function buildPrompt(input: {
-  mode: "general" | "self" | "group" | "dagestan";
-  messageText?: string;
-  username?: string;
-  chatContext?: Array<{ username: string; text: string }>;
-}): string {
-  if (input.mode === "general") {
-    return [
-      "Сделай одну короткую дерзкую шутку для общего чата людей 18-25 лет.",
-      "Шутка должна быть универсальной, без привязки к конкретному человеку.",
-      "Стиль: наблюдательный Telegram-панчлайн, не набор слов кринж/база/вайб.",
-      "Добавь максимум 1 emoji, если уместно.",
-      "Верни только текст шутки.",
-    ].join("\n");
-  }
-
-  if (input.mode === "self") {
-    return [
-      `Пользователь: @${input.username ?? "unknown"}.`,
-      "Пользователь сам попросил подколку командой roastme.",
-      "Сделай короткую дерзкую, но добродушную самоироничную шутку про автора.",
-      "Стиль: наблюдательный Telegram-панчлайн для людей до 25 лет.",
-      "Добавь максимум 1 emoji, если уместно.",
-      "Не используй шаблонные слова кринж, база, минус вайб и emoji 🤡.",
-      "Верни только текст шутки.",
-    ].join("\n");
-  }
-
-  if (input.mode === "dagestan") {
-    return [
-      "Дай один короткий интересный факт про Дагестан для друзей, которые едут туда в автобусный тур.",
-      "Факт должен быть полезным или неожиданным: природа, история, еда, горы, аулы, культура, Каспий или маршрутные наблюдения.",
-      "Не выдумывай точные цифры, даты и названия, если не уверен.",
-      "Стиль: живо, просто, без лекции, можно с лёгкой шуткой в конце.",
-      "Длина: 1-2 коротких предложения.",
-      "Верни только текст факта.",
-    ].join("\n");
-  }
-
-  return [
-    "Последние сообщения чата:",
-    renderChatContext(input.chatContext ?? []),
-    `Автор сообщения: @${input.username ?? "unknown"}.`,
-    `Текст сообщения: "${input.messageText ?? ""}".`,
-    "Сделай короткую дерзкую смешную реакцию на текущий разговор для общего чата людей 18-25 лет.",
-    "Можно опираться на контекст последних сообщений, но не выбирай конкретного человека как цель шутки.",
-    "Реагируй на формулировку, тему или общий вайб диалога, без унижения автора.",
-    "Стиль: наблюдательный Telegram-панчлайн, не литературная цитата и не набор слов кринж/база/вайб.",
-    "Добавь максимум 1 emoji, если уместно.",
-    "Не используй emoji 🤡.",
-    "Верни только текст шутки.",
-  ].join("\n");
+function hasGoogleMeetAccess(): boolean {
+  return Boolean(googleClientId && googleClientSecret && googleRefreshToken);
 }
 
-function sanitizeAiReply(input: string | undefined): string {
-  if (!input) {
-    return "";
+async function isChatAdministrator(ctx: Context): Promise<boolean> {
+  const chat = ctx.chat;
+  const from = ctx.from;
+
+  if (!chat || !from || (chat.type !== "group" && chat.type !== "supergroup")) {
+    return false;
   }
 
-  const cleanedLines = input
-    .replace(/\*\*/g, "")
-    .split(/\r?\n/)
-    .map((line) =>
-      line
-        .replace(/^\s*[-*]\s+/, "")
-        .replace(/^\s*(context|контекст|answer|ответ)\s*:?\s*/i, "")
-        .replace(/^["'«»]+|["'«»]+$/g, "")
-        .trim(),
-    )
-    .filter(Boolean)
-    .filter((line) => !/^(last chat|последние сообщения|chat context)\b/i.test(line));
-
-  return (cleanedLines[0] ?? "").slice(0, 280);
+  const administrators = await ctx.getChatAdministrators();
+  return administrators.some((member) => member.user.id === from.id);
 }
 
-function rememberMessage(chatId: number, message: { username: string; text: string }): void {
-  const messages = recentMessagesByChat.get(chatId) ?? [];
-  messages.push({
-    username: message.username,
-    text: message.text.slice(0, 280),
-  });
-
-  if (messages.length > maxContextMessages) {
-    messages.splice(0, messages.length - maxContextMessages);
-  }
-
-  recentMessagesByChat.set(chatId, messages);
+function parseChatIds(input: string | undefined): Set<number> {
+  return new Set(
+    (input ?? "")
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean)
+      .map((value) => Number(value))
+      .filter((value) => Number.isSafeInteger(value) && value !== 0),
+  );
 }
 
-function renderChatContext(messages: Array<{ username: string; text: string }>): string {
-  if (messages.length === 0) {
-    return "Контекст пока пустой.";
-  }
+function getMoscowDateParts(date: Date): { year: number; month: number; day: number } {
+  const values = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Europe/Moscow",
+    year: "numeric",
+    month: "numeric",
+    day: "numeric",
+  }).formatToParts(date);
+  const valueByType = Object.fromEntries(
+    values.filter((part) => part.type !== "literal").map((part) => [part.type, part.value]),
+  );
 
-  return messages
-    .map((message) => `@${message.username}: ${message.text}`)
-    .join("\n");
+  return {
+    year: Number(valueByType.year),
+    month: Number(valueByType.month),
+    day: Number(valueByType.day),
+  };
 }
 
 function getChatLogInfo(chat: {
@@ -389,12 +268,7 @@ function getChatLogInfo(chat: {
   type: string;
   title?: string;
   username?: string;
-}): {
-  id: number;
-  type: string;
-  title: string | null;
-  username: string | null;
-} {
+}): { id: number; type: string; title: string | null; username: string | null } {
   return {
     id: chat.id,
     type: chat.type,
@@ -402,37 +276,3 @@ function getChatLogInfo(chat: {
     username: chat.username ?? null,
   };
 }
-
-function getUserLogInfo(user: {
-  id: number;
-  is_bot: boolean;
-  first_name: string;
-  last_name?: string;
-  username?: string;
-}): {
-  id: number;
-  isBot: boolean;
-  firstName: string;
-  lastName: string | null;
-  username: string | null;
-} {
-  return {
-    id: user.id,
-    isBot: user.is_bot,
-    firstName: user.first_name,
-    lastName: user.last_name ?? null,
-    username: user.username ?? null,
-  };
-}
-
-type GeminiGenerateContentResponse = {
-  candidates?: Array<{
-    finishReason?: string;
-    content?: {
-      parts?: Array<{
-        text?: string;
-      }>;
-    };
-  }>;
-  usageMetadata?: Record<string, unknown>;
-};

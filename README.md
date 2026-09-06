@@ -1,14 +1,6 @@
-# Telegram Group Bot
+# Manager Bot
 
-Минимальный Telegram-бот для группы на `TypeScript + Telegraf`.
-
-Что умеет:
-
-- реагировать на обычные сообщения в группе
-- чаще реагировать на пользователей из `TARGET_USER_IDS`
-- генерировать шутки через Gemini для пользователей из `TARGET_USERNAMES`
-- отвечать с cooldown, чтобы не спамить
-- поддерживать команды `/joke`, `/roastme`, `/dag` и `/id`
+Telegram-бот для рабочих групп. Сейчас он автоматически отправляет ссылку на общий Google Meet по вторникам и четвергам в 10:30 по Москве.
 
 ## Запуск
 
@@ -18,33 +10,31 @@ cp .env.example .env
 npm run dev
 ```
 
-## Настройка Telegram
+## Настройка
 
-1. Создай бота через `@BotFather`
-2. Получи токен и вставь его в `.env`
-3. Выключи `Privacy Mode` через `@BotFather -> /mybots -> Bot Settings -> Group Privacy -> Turn off`
-4. Добавь бота в группу
-5. Если хочешь, чтобы бот чаще реагировал на конкретного участника, укажи его numeric `user_id` в `TARGET_USER_IDS`
+В `.env` заполните:
 
-## Переменные окружения
+- `BOT_TOKEN` — токен из BotFather.
+- `TARGET_CHAT_IDS` — id групп через запятую.
+- `MEETING_URL` — запасная ссылка Google Meet, если доступ Google временно недоступен.
+- `MEETING_MESSAGE` — текст перед ссылкой, необязательно.
+- `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN` — OAuth-данные Google с разрешением `https://www.googleapis.com/auth/meetings.space.created`.
 
-- `BOT_TOKEN` - токен бота
-- `BOT_USERNAME` - имя бота без `@`, опционально для будущих доработок
-- `TARGET_USER_IDS` - список numeric user id через запятую
-- `TARGET_USERNAMES` - список Telegram username через запятую, например `Yharitonovich`
-- `ROAST_COOLDOWN_MS` - минимальная пауза между ответами в одном чате, например `180000`
-- `REPLY_CHANCE_PERCENT` - шанс случайной реакции на обычное сообщение, например `35`
-- `GEMINI_API_KEY` - ключ Gemini API
-- `GEMINI_MODEL` - модель Gemini, по умолчанию `gemini-3.1-flash-lite`
+Добавьте бота в каждую рабочую группу. Вызовите в ней `/chatid` и вставьте полученный `chat_id` в `TARGET_CHAT_IDS`. Затем перезапустите бота.
 
-## Как узнать user id
+Пример:
 
-Самый быстрый способ:
+```env
+TARGET_CHAT_IDS=-1001234567890,-1009876543210
+MEETING_URL=https://meet.google.com/abc-defg-hij
+```
 
-- написать боту в личку
-- временно добавить `console.log(ctx.from)` в обработчик
-- или использовать любого служебного Telegram ID бота
+Расписание считается в часовом поясе `Europe/Moscow`, поэтому не зависит от часового пояса сервера.
 
-## Production
+## Новая ссылка Google Meet
 
-Для простого хостинга подойдут `Railway`, `Render` или VPS с `pm2`.
+Команда `/newmeet` доступна администраторам рабочей группы: она создаёт отдельный Google Meet и сразу отправляет ссылку в чат. При заполненных OAuth-переменных автоматические рассылки во вторник и четверг тоже создают новую ссылку для каждого созвона. Без них бот использует `MEETING_URL`.
+
+## Дальше
+
+На этой основе можно добавить постановку задач, вопросы в группы, сбор контекста и аналитику. Сейчас бот не читает и не анализирует переписку и не использует AI-ключи.
