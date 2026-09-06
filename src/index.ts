@@ -34,6 +34,9 @@ const meetingMinuteMoscow = 30;
 const moscowUtcOffsetHours = 3;
 const meetingSummaryPollIntervalMs = 5 * 60 * 1000;
 const maxMeetingTranscriptCharacters = 60_000;
+const meetingReminderLeadMinutes = 10;
+const meetingReminderMessage = "The meeting starts in 10 minutes. Join using this link:";
+const meetingStartMessage = "The meeting is starting now. Please join using this link:";
 
 const helpText = [
   "Я manager-бот: по понедельникам–четвергам в 10:30 МСК присылаю ссылку на общий созвон.",
@@ -47,6 +50,7 @@ const helpText = [
 const bot = new Telegraf(token);
 const meetingSubscriptionChatIds = new Set<number>(targetChatIds);
 const meetingSummarySpaces = new Map<string, MeetingSummarySpace>();
+let nextScheduledMeeting: ScheduledMeeting | undefined;
 let isMeetingSummaryCheckRunning = false;
 
 console.log("Manager bot config loaded", {
@@ -339,15 +343,23 @@ function escapeHtml(value: string): string {
 }
 
 function scheduleNextMeetingAnnouncement(): void {
-  const nextRunAt = getNextMeetingRunAt(new Date());
-  const delayMs = nextRunAt.getTime() - Date.now();
+  const startsAt = getNextMeetingRunAt(new Date());
+  const reminderAt = new Date(startsAt.getTime() - meetingReminderLeadMinutes * 60 * 1000);
+  const reminderDelayMs = Math.max(0, reminderAt.getTime() - Date.now());
+  const startDelayMs = startsAt.getTime() - Date.now();
 
-  console.log("Next meeting announcement scheduled", { nextRunAt: nextRunAt.toISOString(), delayMs });
+  console.log("Next meeting reminders scheduled", {
+    reminderAt: reminderAt.toISOString(),
+    startsAt: startsAt.toISOString(),
+    reminderDelayMs,
+    startDelayMs,
+  });
 
+  setTimeout(() => void announceUpcomingMeeting(startsAt), reminderDelayMs);
   setTimeout(async () => {
-    await announceMeeting();
+    await announceMeetingStart(startsAt);
     scheduleNextMeetingAnnouncement();
-  }, delayMs);
+  }, startDelayMs);
 }
 
 function getNextMeetingRunAt(now: Date): Date {
@@ -380,20 +392,45 @@ function getNextMeetingRunAt(now: Date): Date {
   throw new Error("Could not calculate the next meeting announcement time");
 }
 
-async function announceMeeting(): Promise<void> {
+async function announceUpcomingMeeting(startsAt: Date): Promise<void> {
   if (meetingSubscriptionChatIds.size === 0) {
-    console.warn("Meeting announcement skipped: no groups are subscribed");
+    console.warn("Meeting reminder skipped: no groups are subscribed");
     return;
   }
 
   const url = await getMeetingUrlForAnnouncement();
 
   if (!url) {
-    console.warn("Meeting announcement skipped: no Google Meet access and MEETING_URL is empty");
+    console.warn("Meeting reminder skipped: no Google Meet access and MEETING_URL is empty");
     return;
   }
 
-  const text = `${meetingMessage}\n${url}`;
+  nextScheduledMeeting = { startsAt: startsAt.toISOString(), url };
+  await sendScheduledMeetingMessage(`${meetingReminderMessage}\n${url}`, "Meeting reminder");
+}
+
+async function announceMeetingStart(startsAt: Date): Promise<void> {
+  if (meetingSubscriptionChatIds.size === 0) {
+    console.warn("Meeting start announcement skipped: no groups are subscribed");
+    return;
+  }
+
+  const scheduledMeeting = nextScheduledMeeting;
+  const url = scheduledMeeting?.startsAt === startsAt.toISOString()
+    ? scheduledMeeting.url
+    : await getMeetingUrlForAnnouncement();
+
+  nextScheduledMeeting = undefined;
+
+  if (!url) {
+    console.warn("Meeting start announcement skipped: no Google Meet access and MEETING_URL is empty");
+    return;
+  }
+
+  await sendScheduledMeetingMessage(`${meetingStartMessage}\n${url}`, "Meeting start announcement");
+}
+
+async function sendScheduledMeetingMessage(text: string, logPrefix: string): Promise<void> {
   const chatIds = [...meetingSubscriptionChatIds];
   const results = await Promise.allSettled(
     chatIds.map((chatId) => bot.telegram.sendMessage(chatId, text)),
@@ -402,11 +439,11 @@ async function announceMeeting(): Promise<void> {
   results.forEach((result, index) => {
     const chatId = chatIds[index];
     if (result.status === "fulfilled") {
-      console.log("Meeting announcement sent", { chatId });
+      console.log(`${logPrefix} sent`, { chatId });
       return;
     }
 
-    console.error("Meeting announcement failed", { chatId, error: result.reason });
+    console.error(`${logPrefix} failed`, { chatId, error: result.reason });
   });
 }
 
@@ -514,6 +551,7 @@ async function createGoogleMeet(): Promise<string> {
     throw new Error("Google Meet credentials are not configured");
   }
 
+  console.log("Google Meet creation started", { autoTranscriptionRequested: true });
   const accessToken = await getGoogleAccessToken();
   let response = await createGoogleMeetSpace(accessToken, true);
   if (!response.ok) {
@@ -534,6 +572,10 @@ async function createGoogleMeet(): Promise<string> {
     await trackMeetingForSummary(payload.name);
   }
 
+  console.log("Google Meet created", {
+    spaceName: payload.name ?? null,
+    autoTranscriptionTracking: Boolean(payload.name && meetingSummaryChatIds.size > 0),
+  });
   return payload.meetingUri;
 }
 
@@ -564,12 +606,18 @@ function createGoogleMeetSpace(accessToken: string, enableAutoTranscription: boo
 
 async function trackMeetingForSummary(spaceName: string): Promise<void> {
   if (meetingSummaryChatIds.size === 0 || meetingSummarySpaces.has(spaceName)) {
+    console.log("Meeting transcript tracking skipped", {
+      spaceName,
+      hasSummaryDestination: meetingSummaryChatIds.size > 0,
+      alreadyTracked: meetingSummarySpaces.has(spaceName),
+    });
     return;
   }
 
   meetingSummarySpaces.set(spaceName, { createdAt: new Date().toISOString(), summarySent: false });
   try {
     await saveMeetingSummaryState();
+    console.log("Meeting transcript tracking saved", { spaceName });
   } catch (error) {
     meetingSummarySpaces.delete(spaceName);
     console.error("Meeting summary tracking could not be saved", { spaceName, error });
@@ -588,11 +636,18 @@ function scheduleMeetingSummaryChecks(): void {
 
 async function checkMeetingSummaries(): Promise<void> {
   if (isMeetingSummaryCheckRunning || meetingSummaryChatIds.size === 0 || !hasGoogleMeetAccess() || !hasGeminiAccess()) {
+    console.log("Meeting transcript check skipped", {
+      alreadyRunning: isMeetingSummaryCheckRunning,
+      summaryDestinations: meetingSummaryChatIds.size,
+      hasGoogleMeetAccess: hasGoogleMeetAccess(),
+      hasGeminiAccess: hasGeminiAccess(),
+    });
     return;
   }
 
   isMeetingSummaryCheckRunning = true;
   try {
+    console.log("Meeting transcript check started", { trackedMeetings: meetingSummarySpaces.size });
     const accessToken = await getGoogleAccessToken();
     let stateChanged = false;
 
@@ -604,24 +659,31 @@ async function checkMeetingSummaries(): Promise<void> {
       if (Date.now() - Date.parse(meeting.createdAt) > 31 * 24 * 60 * 60 * 1000) {
         meetingSummarySpaces.delete(spaceName);
         stateChanged = true;
+        console.warn("Meeting transcript tracking expired", { spaceName, createdAt: meeting.createdAt });
         continue;
       }
 
+      console.log("Meeting transcript status requested", { spaceName, createdAt: meeting.createdAt });
       const transcript = await getGeneratedMeetingTranscript(spaceName, accessToken);
       if (!transcript) {
+        console.log("Meeting transcript is not ready yet", { spaceName });
         continue;
       }
 
       const transcriptText = await getMeetingTranscriptText(transcript.name, accessToken);
       if (!transcriptText) {
+        console.warn("Meeting transcript has no readable entries", { spaceName, transcriptName: transcript.name });
         continue;
       }
 
+      console.log("Meeting transcript collected", { spaceName, transcriptName: transcript.name, characters: transcriptText.length });
       const summary = await summarizeMeetingTranscript(transcriptText);
       if (!summary) {
+        console.warn("Meeting transcript summary was empty", { spaceName, transcriptName: transcript.name });
         continue;
       }
 
+      console.log("Meeting summary generated", { spaceName, characters: summary.length, destinations: meetingSummaryChatIds.size });
       const results = await Promise.allSettled(
         [...meetingSummaryChatIds].map((chatId) => bot.telegram.sendMessage(chatId, `Итог созвона\n${summary}`)),
       );
@@ -654,17 +716,31 @@ async function getGeneratedMeetingTranscript(spaceName: string, accessToken: str
   const records = await fetchMeetJson<MeetConferenceRecordsResponse>(`/v2/conferenceRecords?${query}`, accessToken);
   const conference = records.conferenceRecords?.[0];
   if (!conference?.name || !conference.endTime) {
+    console.log("Meeting conference has not ended or is not available", {
+      spaceName,
+      conferenceFound: Boolean(conference?.name),
+      ended: Boolean(conference?.endTime),
+    });
     return undefined;
   }
 
   const transcripts = await fetchMeetJson<MeetTranscriptsResponse>(`/v2/${conference.name}/transcripts?pageSize=10`, accessToken);
-  return transcripts.transcripts?.find((transcript) => transcript.state === "FILE_GENERATED");
+  const transcript = transcripts.transcripts?.find((item) => item.state === "FILE_GENERATED");
+  console.log("Meeting transcript artifacts checked", {
+    spaceName,
+    conferenceName: conference.name,
+    transcriptCount: transcripts.transcripts?.length ?? 0,
+    transcriptStates: transcripts.transcripts?.map((item) => item.state ?? "UNKNOWN") ?? [],
+    generated: Boolean(transcript),
+  });
+  return transcript;
 }
 
 async function getMeetingTranscriptText(transcriptName: string, accessToken: string): Promise<string | undefined> {
   let pageToken: string | undefined;
   const fragments: string[] = [];
   let characterCount = 0;
+  let entryCount = 0;
 
   do {
     const query = new URLSearchParams({ pageSize: "100" });
@@ -680,14 +756,17 @@ async function getMeetingTranscriptText(transcriptName: string, accessToken: str
       }
 
       fragments.push(text);
+      entryCount += 1;
       characterCount += text.length + 1;
       if (characterCount >= maxMeetingTranscriptCharacters) {
+        console.warn("Meeting transcript truncated to configured limit", { transcriptName, entryCount, characterCount });
         return fragments.join("\n").slice(0, maxMeetingTranscriptCharacters);
       }
     }
     pageToken = page.nextPageToken;
   } while (pageToken);
 
+  console.log("Meeting transcript entries fetched", { transcriptName, entryCount, characterCount });
   return fragments.length > 0 ? fragments.join("\n") : undefined;
 }
 
@@ -704,6 +783,7 @@ async function fetchMeetJson<T>(path: string, accessToken: string): Promise<T> {
 
 async function summarizeMeetingTranscript(transcript: string): Promise<string | undefined> {
   try {
+    console.log("Meeting transcript summary requested", { transcriptCharacters: transcript.length, model: geminiModel });
     const response = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(geminiModel)}:generateContent?key=${encodeURIComponent(geminiApiKey!)}`,
       {
@@ -736,6 +816,7 @@ async function summarizeMeetingTranscript(transcript: string): Promise<string | 
 
     const body = (await response.json()) as GeminiGenerateContentResponse;
     const summary = extractGeminiText(body);
+    console.log("Meeting transcript summary response received", { hasSummary: Boolean(summary), summaryCharacters: summary?.length ?? 0 });
     return summary ? summary.slice(0, 1200) : undefined;
   } catch (error) {
     console.error("Meeting transcript summary failed", error);
@@ -871,6 +952,11 @@ type GoogleMeetSpace = {
 type MeetingSummarySpace = {
   createdAt: string;
   summarySent: boolean;
+};
+
+type ScheduledMeeting = {
+  startsAt: string;
+  url: string;
 };
 
 type MeetConferenceRecordsResponse = {
