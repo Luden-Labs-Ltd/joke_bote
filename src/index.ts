@@ -82,10 +82,15 @@ bot.catch((error) => {
   console.error("Bot error", error);
 });
 
-bot.launch().then(() => {
-  console.log("Manager bot is running", { botUsername: process.env.BOT_USERNAME || null });
-  scheduleNextMeetingAnnouncement();
-});
+void bot
+  .launch()
+  .then(() => {
+    console.log("Manager bot is running", { botUsername: process.env.BOT_USERNAME || null });
+    scheduleNextMeetingAnnouncement();
+  })
+  .catch((error: unknown) => {
+    console.error("Telegram polling failed; GitHub webhook server will stay online", error);
+  });
 
 startGitHubWebhookServer();
 
