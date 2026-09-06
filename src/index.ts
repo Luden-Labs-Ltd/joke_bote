@@ -178,7 +178,11 @@ async function createGoogleMeet(): Promise<string> {
       Authorization: `Bearer ${accessToken}`,
       "Content-Type": "application/json",
     },
-    body: "{}",
+    body: JSON.stringify({
+      config: {
+        accessType: "OPEN",
+      },
+    }),
   });
 
   if (!response.ok) {
