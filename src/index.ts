@@ -1,4 +1,7 @@
 import dotenv from "dotenv";
+import { createHmac, timingSafeEqual } from "node:crypto";
+import { createServer } from "node:http";
+import type { IncomingMessage } from "node:http";
 import { Context, Telegraf } from "telegraf";
 
 dotenv.config();
@@ -14,6 +17,9 @@ const googleClientId = process.env.GOOGLE_CLIENT_ID?.trim();
 const googleClientSecret = process.env.GOOGLE_CLIENT_SECRET?.trim();
 const googleRefreshToken = process.env.GOOGLE_REFRESH_TOKEN?.trim();
 const targetChatIds = parseChatIds(process.env.TARGET_CHAT_IDS);
+const githubWebhookSecret = process.env.GITHUB_WEBHOOK_SECRET?.trim();
+const githubCommitChatIds = parseChatIds(process.env.GITHUB_COMMIT_CHAT_IDS);
+const port = Number(process.env.PORT) || 3000;
 const meetingMessage = process.env.MEETING_MESSAGE?.trim() || "Созвон начинаем в 10:30 МСК. Ссылка на Google Meet:";
 const meetingDays = new Set([2, 4]);
 const meetingHourMoscow = 10;
@@ -35,6 +41,8 @@ console.log("Manager bot config loaded", {
   targetChatIdsCount: targetChatIds.size,
   hasMeetingUrl: Boolean(meetingUrl),
   hasGoogleMeetAccess: hasGoogleMeetAccess(),
+  githubCommitChatIdsCount: githubCommitChatIds.size,
+  hasGitHubWebhookSecret: Boolean(githubWebhookSecret),
   schedule: "Tuesday and Thursday, 10:30 Europe/Moscow",
 });
 
@@ -79,8 +87,109 @@ bot.launch().then(() => {
   scheduleNextMeetingAnnouncement();
 });
 
+startGitHubWebhookServer();
+
 process.once("SIGINT", () => bot.stop("SIGINT"));
 process.once("SIGTERM", () => bot.stop("SIGTERM"));
+
+function startGitHubWebhookServer(): void {
+  createServer(async (request, response) => {
+    if (request.method !== "POST" || request.url !== "/webhooks/github") {
+      response.writeHead(404).end();
+      return;
+    }
+
+    if (!githubWebhookSecret || githubCommitChatIds.size === 0) {
+      response.writeHead(503).end("GitHub webhook is not configured");
+      return;
+    }
+
+    try {
+      const payloadBody = await readRequestBody(request);
+      if (!hasValidGitHubSignature(payloadBody, request.headers["x-hub-signature-256"])) {
+        response.writeHead(401).end("Invalid signature");
+        return;
+      }
+
+      if (request.headers["x-github-event"] !== "push") {
+        response.writeHead(204).end();
+        return;
+      }
+
+      const payload = JSON.parse(payloadBody.toString("utf8")) as GitHubPushPayload;
+      response.writeHead(202).end("Accepted");
+      void announceGitHubPush(payload);
+    } catch (error) {
+      console.error("GitHub webhook handling failed", error);
+      if (!response.headersSent) {
+        response.writeHead(400).end("Invalid webhook payload");
+      }
+    }
+  }).listen(port, () => {
+    console.log("GitHub webhook server is listening", { port, path: "/webhooks/github" });
+  });
+}
+
+async function readRequestBody(request: IncomingMessage): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let length = 0;
+
+  for await (const chunk of request) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    length += buffer.length;
+    if (length > 1_000_000) {
+      throw new Error("Webhook payload is too large");
+    }
+    chunks.push(buffer);
+  }
+
+  return Buffer.concat(chunks);
+}
+
+function hasValidGitHubSignature(payloadBody: Buffer, signatureHeader: string | string[] | undefined): boolean {
+  const signature = Array.isArray(signatureHeader) ? signatureHeader[0] : signatureHeader;
+  if (!githubWebhookSecret || !signature) {
+    return false;
+  }
+
+  const expected = `sha256=${createHmac("sha256", githubWebhookSecret).update(payloadBody).digest("hex")}`;
+  const actual = Buffer.from(signature);
+  const expectedBuffer = Buffer.from(expected);
+
+  return actual.length === expectedBuffer.length && timingSafeEqual(actual, expectedBuffer);
+}
+
+async function announceGitHubPush(payload: GitHubPushPayload): Promise<void> {
+  if (payload.deleted || payload.commits.length === 0) {
+    return;
+  }
+
+  const messages = payload.commits.map((commit) => formatGitHubCommitMessage(payload, commit));
+  const results = await Promise.allSettled(
+    [...githubCommitChatIds].flatMap((chatId) =>
+      messages.map((text) => bot.telegram.sendMessage(chatId, text, { parse_mode: "HTML", link_preview_options: { is_disabled: true } })),
+    ),
+  );
+
+  results.forEach((result) => {
+    if (result.status === "rejected") {
+      console.error("GitHub commit notification failed", result.reason);
+    }
+  });
+}
+
+function formatGitHubCommitMessage(payload: GitHubPushPayload, commit: GitHubCommit): string {
+  const project = escapeHtml(payload.repository.full_name);
+  const author = escapeHtml(commit.author.username || commit.author.name || payload.sender.login);
+  const message = escapeHtml(commit.message.trim());
+  const commitUrl = `${payload.repository.html_url}/commit/${commit.id}`;
+
+  return [`Проект: ${project}`, `Автор: ${author}`, `Коммит: <a href="${commitUrl}">${commit.id}</a>`, message].join("\n");
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>\"]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[character]!);
+}
 
 function scheduleNextMeetingAnnouncement(): void {
   const nextRunAt = getNextMeetingRunAt(new Date());
@@ -280,3 +389,24 @@ function getChatLogInfo(chat: {
     username: chat.username ?? null,
   };
 }
+
+type GitHubCommit = {
+  id: string;
+  message: string;
+  author: {
+    name: string;
+    username?: string;
+  };
+};
+
+type GitHubPushPayload = {
+  deleted: boolean;
+  commits: GitHubCommit[];
+  repository: {
+    full_name: string;
+    html_url: string;
+  };
+  sender: {
+    login: string;
+  };
+};
