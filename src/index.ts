@@ -1204,7 +1204,7 @@ async function checkMeetingSummaries(): Promise<void> {
       if (!meeting.attendanceSent) {
         try {
           const participants = await getMeetingParticipants(conference.name, accessToken);
-          const attendanceText = formatMeetingAttendance(meeting, participants);
+          const attendanceText = formatMeetingAttendance(meeting, conference, participants);
           const results = await Promise.allSettled(
             [...meetingSummaryChatIds].map((chatId) => bot.telegram.sendMessage(chatId, attendanceText)),
           );
@@ -1317,7 +1317,11 @@ async function getMeetingParticipants(conferenceName: string, accessToken: strin
   return participants;
 }
 
-function formatMeetingAttendance(meeting: MeetingSummarySpace, participants: MeetingParticipant[]): string {
+function formatMeetingAttendance(
+  meeting: MeetingSummarySpace,
+  conference: MeetConferenceRecord,
+  participants: MeetingParticipant[],
+): string {
   const heading = [meeting.groupTitle, meeting.project].filter(Boolean).join(" / ") || "Созвон";
   const names = participants
     .map((participant) => participant.signedinUser?.displayName ?? participant.anonymousUser?.displayName ?? participant.phoneUser?.displayName ?? null)
@@ -1326,6 +1330,7 @@ function formatMeetingAttendance(meeting: MeetingSummarySpace, participants: Mee
 
   return [
     `Участники созвона: ${heading}`,
+    `Дата: ${formatMoscowMeetingDate(conference.startTime ?? meeting.createdAt)}`,
     names.length > 0 ? names.map((name) => `• ${name}`).join("\n") : "Google Meet не передал список участников.",
   ].join("\n");
 }
@@ -1483,6 +1488,21 @@ function formatMoscowHour(hour: number): string {
   return `${String(hour).padStart(2, "0")}:00`;
 }
 
+function formatMoscowMeetingDate(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "неизвестно";
+  }
+
+  return new Intl.DateTimeFormat("ru-RU", {
+    timeZone: "Europe/Moscow",
+    day: "numeric",
+    month: "long",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date) + " МСК";
+}
+
 function getCommandArgument(text: string, command: string): string {
   return text.replace(new RegExp(`^/${command}(?:@\\w+)?\\s*`, "i"), "").trim();
 }
@@ -1610,6 +1630,7 @@ type MeetConferenceRecordsResponse = {
 
 type MeetConferenceRecord = {
   name?: string;
+  startTime?: string;
   endTime?: string;
 };
 
