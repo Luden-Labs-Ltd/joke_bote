@@ -155,14 +155,15 @@ async function initializeManagerBot(): Promise<void> {
   await loadMeetingSubscriptions();
   await loadMeetingSummaryState();
 
-  try {
-    await bot.launch();
-    console.log("Manager bot is running", { botUsername: process.env.BOT_USERNAME || null });
-    scheduleNextMeetingAnnouncement();
-    scheduleMeetingSummaryChecks();
-  } catch (error: unknown) {
+  // Telegraf's polling promise stays pending for the lifetime of the bot.
+  // Do not await it here: the schedulers below must start alongside polling.
+  void bot.launch().catch((error: unknown) => {
     console.error("Telegram polling failed; GitHub webhook server will stay online", error);
-  }
+  });
+
+  console.log("Manager bot is starting", { botUsername: process.env.BOT_USERNAME || null });
+  scheduleNextMeetingAnnouncement();
+  scheduleMeetingSummaryChecks();
 }
 
 startGitHubWebhookServer();
