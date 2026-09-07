@@ -20,6 +20,9 @@ npm run dev
 - `MEETING_SUMMARY_FILE` — путь к состоянию ожидающих итогов Meet. На Railway используйте `/data/meeting-summaries.json` в том же Volume.
 - `MEETING_TEST_START_AT` — необязательное точное время разовой тестовой рассылки в ISO-формате, например `2026-09-08T10:20:00+03:00`. `MEETING_TEST_REMINDER_LEAD_MINUTES` задаёт время напоминания до неё.
 - `MEETING_SUMMARY_CHAT_IDS` — id групп Telegram через запятую, куда отправлять итоги созвонов.
+- `DAILY_SUMMARY_CHAT_IDS` — id групп Telegram через запятую, куда отправлять ежедневные сводки переписки. Если не задан, используется `MEETING_SUMMARY_CHAT_IDS`.
+- `DAILY_SUMMARY_HOUR_MOSCOW` — час ежедневной сводки по Москве, по умолчанию `19`.
+- `DAILY_SUMMARY_SUBSCRIPTIONS_FILE`, `DAILY_SUMMARY_FILE` — постоянные файлы подписок и сообщений для ежедневных сводок. На Railway используйте `/data/...` в подключённом Volume.
 - `MEETING_URL` — запасная ссылка Google Meet, если доступ Google временно недоступен.
 - `MEETING_MESSAGE` — текст перед ссылкой, необязательно.
 - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN` — OAuth-данные Google с разрешением `https://www.googleapis.com/auth/meetings.space.created`.
@@ -45,6 +48,12 @@ MEETING_URL=https://meet.google.com/abc-defg-hij
 ## Итоги созвонов
 
 Для новых Meet-ссылок бот запрашивает автотранскрипцию. Когда расшифровка готова, бот получает её через Meet API, делает в Gemini короткий итог с решениями и задачами и отправляет его в `MEETING_SUMMARY_CHAT_IDS`. Если транскрипция недоступна для Google-аккаунта или тарифа, ссылка на Meet всё равно создаётся, но итог не будет отправлен. Для надёжности подключения групп и ожидания итогов подключите Railway Volume в `/data`.
+
+## Ежедневные сводки групп
+
+Администратор может вызвать в рабочей группе `/startsummary crm/api`, где `crm/api` — необязательное название проекта. С этого момента бот сохраняет текстовые сообщения этой группы и каждый день в `DAILY_SUMMARY_HOUR_MOSCOW` по Москве отправляет в `DAILY_SUMMARY_CHAT_IDS` краткую выжимку на русском: решения, задачи с ответственными, блокеры и открытые вопросы. Заголовок сообщения: `НАЗВАНИЕ ГРУППЫ / ПРОЕКТ`. `/stopsummary` отключает сбор и удаляет накопленную переписку этой группы.
+
+Чтобы Telegram передавал боту обычные сообщения группы, в BotFather отключите Privacy Mode: `/setprivacy` → выберите бота → `Disable`. Бот не обрабатывает команды и собственные сообщения, а хранит сообщения только групп, где администратор включил `/startsummary`.
 
 ## Уведомления о коммитах GitHub
 
