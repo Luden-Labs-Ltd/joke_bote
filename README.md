@@ -18,6 +18,7 @@ npm run dev
 - `TARGET_CHAT_IDS` — необязательный первоначальный список id групп через запятую.
 - `MEETING_SUBSCRIPTIONS_FILE` — путь к постоянному файлу подписок групп. На Railway используйте `/data/meeting-subscriptions.json` и подключите Volume в `/data`.
 - `MEETING_SUMMARY_FILE` — путь к состоянию ожидающих итогов Meet. На Railway используйте `/data/meeting-summaries.json` в том же Volume.
+- `MEETING_TEST_START_AT` — необязательное точное время разовой тестовой рассылки в ISO-формате, например `2026-09-08T10:20:00+03:00`. `MEETING_TEST_REMINDER_LEAD_MINUTES` задаёт время напоминания до неё.
 - `MEETING_SUMMARY_CHAT_IDS` — id групп Telegram через запятую, куда отправлять итоги созвонов.
 - `MEETING_URL` — запасная ссылка Google Meet, если доступ Google временно недоступен.
 - `MEETING_MESSAGE` — текст перед ссылкой, необязательно.

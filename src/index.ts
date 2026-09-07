@@ -21,6 +21,8 @@ const googleRefreshToken = process.env.GOOGLE_REFRESH_TOKEN?.trim();
 const targetChatIds = parseChatIds(process.env.TARGET_CHAT_IDS);
 const meetingSubscriptionFile = process.env.MEETING_SUBSCRIPTIONS_FILE?.trim() || "./data/meeting-subscriptions.json";
 const meetingSummaryFile = process.env.MEETING_SUMMARY_FILE?.trim() || "./data/meeting-summaries.json";
+const meetingTestStartAt = process.env.MEETING_TEST_START_AT?.trim();
+const meetingTestReminderLeadMinutes = Number(process.env.MEETING_TEST_REMINDER_LEAD_MINUTES) || 10;
 const meetingSummaryChatIds = parseChatIds(process.env.MEETING_SUMMARY_CHAT_IDS);
 const githubWebhookSecret = process.env.GITHUB_WEBHOOK_SECRET?.trim();
 const githubCommitChatIds = parseChatIds(process.env.GITHUB_COMMIT_CHAT_IDS);
@@ -163,6 +165,7 @@ async function initializeManagerBot(): Promise<void> {
 
   console.log("Manager bot is starting", { botUsername: process.env.BOT_USERNAME || null });
   scheduleNextMeetingAnnouncement();
+  scheduleMeetingTestAnnouncement();
   scheduleMeetingSummaryChecks();
 }
 
@@ -361,6 +364,32 @@ function scheduleNextMeetingAnnouncement(): void {
     await announceMeetingStart(startsAt);
     scheduleNextMeetingAnnouncement();
   }, startDelayMs);
+}
+
+function scheduleMeetingTestAnnouncement(): void {
+  if (!meetingTestStartAt) {
+    return;
+  }
+
+  const startsAt = new Date(meetingTestStartAt);
+  if (Number.isNaN(startsAt.getTime())) {
+    console.error("Meeting test schedule ignored: MEETING_TEST_START_AT is invalid", { meetingTestStartAt });
+    return;
+  }
+
+  const reminderAt = new Date(startsAt.getTime() - meetingTestReminderLeadMinutes * 60 * 1000);
+  if (startsAt.getTime() <= Date.now()) {
+    console.warn("Meeting test schedule ignored: its start time has already passed", { startsAt: startsAt.toISOString() });
+    return;
+  }
+
+  console.log("One-off meeting test scheduled", {
+    reminderAt: reminderAt.toISOString(),
+    startsAt: startsAt.toISOString(),
+  });
+
+  setTimeout(() => void announceUpcomingMeeting(startsAt), Math.max(0, reminderAt.getTime() - Date.now()));
+  setTimeout(() => void announceMeetingStart(startsAt), startsAt.getTime() - Date.now());
 }
 
 function getNextMeetingRunAt(now: Date): Date {
