@@ -49,16 +49,18 @@ const maxDailySummaryCharacters = 60_000;
 const helpText = [
   "Я manager-бот: по понедельникам–четвергам в 10:30 МСК присылаю ссылку на общий созвон.",
   "",
-  "/startmeet — подключить эту группу к расписанию (для администратора)",
+  "/startmeet [проект] — подключить эту группу к расписанию отдельных созвонов (для администратора)",
   "/stopmeet — отключить эту группу от расписания (для администратора)",
   "/newmeet — создать новую ссылку Google Meet (для администратора группы)",
   "/startsummary [проект] — включить ежедневную сводку переписки этой группы (для администратора)",
+  "/summarynow — отправить сводку за сегодня сразу (для администратора)",
   "/stopsummary — отключить ежедневную сводку этой группы (для администратора)",
   "/help — эта справка",
 ].join("\n");
 
 const bot = new Telegraf(token);
 const meetingSubscriptionChatIds = new Set<number>(targetChatIds);
+const meetingSubscriptions = new Map<number, MeetingSubscription>();
 const meetingSummarySpaces = new Map<string, MeetingSummarySpace>();
 const dailySummarySubscriptionChatIds = new Set<number>();
 const dailySummaryState = new Map<number, DailySummaryGroupState>();
@@ -102,18 +104,30 @@ bot.command("startmeet", async (ctx) => {
   }
 
   const isNewSubscription = !meetingSubscriptionChatIds.has(ctx.chat.id);
+  const previousSubscription = meetingSubscriptions.get(ctx.chat.id);
+  const project = getCommandArgument(ctx.message.text, "startmeet");
+  const subscription: MeetingSubscription = {
+    title: getChatTitle(ctx.chat),
+    project: project || null,
+  };
   meetingSubscriptionChatIds.add(ctx.chat.id);
+  meetingSubscriptions.set(ctx.chat.id, subscription);
 
   try {
     await saveMeetingSubscriptions();
     await ctx.reply(
       isNewSubscription
-        ? "Группа подключена: новые ссылки Google Meet будут приходить с понедельника по четверг в 10:30 МСК."
-        : "Эта группа уже подключена к расписанию: с понедельника по четверг в 10:30 МСК.",
+        ? `Группа подключена: для «${subscription.title}» будут создаваться отдельные ссылки Google Meet с понедельника по четверг в 10:30 МСК.${subscription.project ? ` Проект: ${subscription.project}.` : ""}`
+        : `Настройки созвонов обновлены.${subscription.project ? ` Проект: ${subscription.project}.` : ""}`,
     );
   } catch (error) {
     if (isNewSubscription) {
       meetingSubscriptionChatIds.delete(ctx.chat.id);
+    }
+    if (previousSubscription) {
+      meetingSubscriptions.set(ctx.chat.id, previousSubscription);
+    } else {
+      meetingSubscriptions.delete(ctx.chat.id);
     }
     console.error("Meeting subscription could not be saved", { chatId: ctx.chat.id, error });
     await ctx.reply("Не смог сохранить подписку на созвоны. Проверьте хранилище бота.");
@@ -132,12 +146,17 @@ bot.command("stopmeet", async (ctx) => {
   }
 
   meetingSubscriptionChatIds.delete(ctx.chat.id);
+  const previousSubscription = meetingSubscriptions.get(ctx.chat.id);
+  meetingSubscriptions.delete(ctx.chat.id);
 
   try {
     await saveMeetingSubscriptions();
     await ctx.reply("Группа отключена от расписания созвонов.");
   } catch (error) {
     meetingSubscriptionChatIds.add(ctx.chat.id);
+    if (previousSubscription) {
+      meetingSubscriptions.set(ctx.chat.id, previousSubscription);
+    }
     console.error("Meeting subscription could not be removed", { chatId: ctx.chat.id, error });
     await ctx.reply("Не смог сохранить изменение. Проверьте хранилище бота.");
   }
@@ -150,7 +169,7 @@ bot.command("newmeet", async (ctx) => {
   }
 
   try {
-    const url = await createGoogleMeet();
+    const url = await createGoogleMeet(getMeetingContext(ctx.chat.id));
     await ctx.reply(`${meetingMessage}\n${url}`);
     console.log("Manual Google Meet created", { chatId: ctx.chat.id, requestedBy: ctx.from?.id ?? null });
   } catch (error) {
@@ -198,6 +217,42 @@ bot.command("startsummary", async (ctx) => {
     }
     console.error("Daily summary subscription could not be saved", { chatId: ctx.chat.id, error });
     await ctx.reply("Не смог сохранить подписку на ежедневные сводки. Проверьте хранилище бота.");
+  }
+});
+
+bot.command("summarynow", async (ctx) => {
+  if (!(await isChatAdministrator(ctx))) {
+    await ctx.reply("Эта команда доступна только администраторам группы.");
+    return;
+  }
+
+  if (!dailySummarySubscriptionChatIds.has(ctx.chat.id)) {
+    await ctx.reply("Сначала включите сбор сообщений: /startsummary [проект].");
+    return;
+  }
+
+  if (dailySummaryChatIds.size === 0 || !hasGeminiAccess()) {
+    await ctx.reply("Не настроен чат для сводок или доступ Gemini.");
+    return;
+  }
+
+  if (isDailySummaryRunning) {
+    await ctx.reply("Сводка уже формируется, подождите немного.");
+    return;
+  }
+
+  isDailySummaryRunning = true;
+  try {
+    const result = await sendDailySummaryForChat(ctx.chat.id, getMoscowDateKey(new Date()));
+    await ctx.reply(
+      result === "sent"
+        ? "Сводка отправлена в управляющий чат. Эти сообщения не будут продублированы в 19:00."
+        : result === "no_messages"
+          ? "За сегодня пока нет сохранённых обычных сообщений для сводки."
+          : "Не смог сформировать сводку. Проверьте логи бота.",
+    );
+  } finally {
+    isDailySummaryRunning = false;
   }
 });
 
@@ -527,47 +582,45 @@ async function sendDailySummaries(): Promise<void> {
   isDailySummaryRunning = true;
   try {
     const date = getMoscowDateKey(new Date());
-    let stateChanged = false;
 
     for (const chatId of dailySummarySubscriptionChatIds) {
-      const state = dailySummaryState.get(chatId);
-      const day = state?.days[date];
-      if (!state || !day?.messages.length) {
-        console.log("Daily group summary skipped: no messages", { chatId, date });
-        continue;
-      }
-
-      const summary = await summarizeDailyGroupMessages(day.messages);
-      if (!summary) {
-        console.warn("Daily group summary was empty", { chatId, date, messageCount: day.messages.length });
-        continue;
-      }
-
-      const heading = [day.title ?? "Без названия", state.project].filter(Boolean).join(" / ");
-      const results = await Promise.allSettled(
-        [...dailySummaryChatIds].map((destinationChatId) =>
-          bot.telegram.sendMessage(destinationChatId, `${heading}\n${summary}`),
-        ),
-      );
-      const failed = results.find((result) => result.status === "rejected");
-      if (failed) {
-        console.error("Daily group summary notification failed", { chatId, error: failed.reason });
-        continue;
-      }
-
-      delete state.days[date];
-      stateChanged = true;
-      console.log("Daily group summary sent", { chatId, date, messageCount: day.messages.length });
-    }
-
-    if (stateChanged) {
-      await saveDailySummaryState();
+      await sendDailySummaryForChat(chatId, date);
     }
   } catch (error) {
     console.error("Daily group summary failed", error);
   } finally {
     isDailySummaryRunning = false;
   }
+}
+
+async function sendDailySummaryForChat(chatId: number, date: string): Promise<"sent" | "no_messages" | "failed"> {
+  const state = dailySummaryState.get(chatId);
+  const day = state?.days[date];
+  if (!state || !day?.messages.length) {
+    console.log("Daily group summary skipped: no messages", { chatId, date });
+    return "no_messages";
+  }
+
+  const summary = await summarizeDailyGroupMessages(day.messages);
+  if (!summary) {
+    console.warn("Daily group summary was empty", { chatId, date, messageCount: day.messages.length });
+    return "failed";
+  }
+
+  const heading = [day.title ?? "Без названия", state.project].filter(Boolean).join(" / ");
+  const results = await Promise.allSettled(
+    [...dailySummaryChatIds].map((destinationChatId) => bot.telegram.sendMessage(destinationChatId, `${heading}\n${summary}`)),
+  );
+  const failed = results.find((result) => result.status === "rejected");
+  if (failed) {
+    console.error("Daily group summary notification failed", { chatId, error: failed.reason });
+    return "failed";
+  }
+
+  delete state.days[date];
+  await saveDailySummaryState();
+  console.log("Daily group summary sent", { chatId, date, messageCount: day.messages.length });
+  return "sent";
 }
 
 async function summarizeDailyGroupMessages(messages: DailySummaryMessage[]): Promise<string | undefined> {
@@ -704,15 +757,14 @@ async function announceUpcomingMeeting(startsAt: Date): Promise<void> {
     return;
   }
 
-  const url = await getMeetingUrlForAnnouncement();
-
-  if (!url) {
+  const meetings = await createScheduledMeetings();
+  if (meetings.size === 0) {
     console.warn("Meeting reminder skipped: no Google Meet access and MEETING_URL is empty");
     return;
   }
 
-  nextScheduledMeeting = { startsAt: startsAt.toISOString(), url };
-  await sendScheduledMeetingMessage(`${meetingReminderMessage}\n${url}`, "Meeting reminder");
+  nextScheduledMeeting = { startsAt: startsAt.toISOString(), urls: meetings };
+  await sendScheduledMeetingMessages(meetings, meetingReminderMessage, "Meeting reminder");
 }
 
 async function announceMeetingStart(startsAt: Date): Promise<void> {
@@ -722,28 +774,46 @@ async function announceMeetingStart(startsAt: Date): Promise<void> {
   }
 
   const scheduledMeeting = nextScheduledMeeting;
-  const url = scheduledMeeting?.startsAt === startsAt.toISOString()
-    ? scheduledMeeting.url
-    : await getMeetingUrlForAnnouncement();
+  const meetings = scheduledMeeting?.startsAt === startsAt.toISOString()
+    ? scheduledMeeting.urls
+    : await createScheduledMeetings();
 
   nextScheduledMeeting = undefined;
 
-  if (!url) {
+  if (meetings.size === 0) {
     console.warn("Meeting start announcement skipped: no Google Meet access and MEETING_URL is empty");
     return;
   }
 
-  await sendScheduledMeetingMessage(`${meetingStartMessage}\n${url}`, "Meeting start announcement");
+  await sendScheduledMeetingMessages(meetings, meetingStartMessage, "Meeting start announcement");
 }
 
-async function sendScheduledMeetingMessage(text: string, logPrefix: string): Promise<void> {
+async function createScheduledMeetings(): Promise<Map<number, string>> {
   const chatIds = [...meetingSubscriptionChatIds];
   const results = await Promise.allSettled(
-    chatIds.map((chatId) => bot.telegram.sendMessage(chatId, text)),
+    chatIds.map(async (chatId) => [chatId, await getMeetingUrlForAnnouncement(getMeetingContext(chatId))] as const),
   );
+  const meetings = new Map<number, string>();
 
   results.forEach((result, index) => {
     const chatId = chatIds[index];
+    if (result.status === "fulfilled" && result.value[1]) {
+      meetings.set(chatId, result.value[1]);
+      return;
+    }
+    console.error("Scheduled Google Meet creation failed for group", { chatId, error: result.status === "rejected" ? result.reason : null });
+  });
+  return meetings;
+}
+
+async function sendScheduledMeetingMessages(meetings: Map<number, string>, text: string, logPrefix: string): Promise<void> {
+  const entries = [...meetings];
+  const results = await Promise.allSettled(
+    entries.map(([chatId, url]) => bot.telegram.sendMessage(chatId, `${text}\n${url}`)),
+  );
+
+  results.forEach((result, index) => {
+    const [chatId] = entries[index];
     if (result.status === "fulfilled") {
       console.log(`${logPrefix} sent`, { chatId });
       return;
@@ -756,8 +826,11 @@ async function sendScheduledMeetingMessage(text: string, logPrefix: string): Pro
 async function loadMeetingSubscriptions(): Promise<void> {
   try {
     const contents = await readFile(meetingSubscriptionFile, "utf8");
-    const storedChatIds = parseStoredChatIds(JSON.parse(contents) as unknown);
-    storedChatIds.forEach((chatId) => meetingSubscriptionChatIds.add(chatId));
+    const storedSubscriptions = parseMeetingSubscriptions(JSON.parse(contents) as unknown);
+    storedSubscriptions.forEach((subscription, chatId) => {
+      meetingSubscriptionChatIds.add(chatId);
+      meetingSubscriptions.set(chatId, subscription);
+    });
     console.log("Meeting subscriptions loaded", { count: meetingSubscriptionChatIds.size });
   } catch (error: unknown) {
     if (isMissingFileError(error)) {
@@ -770,11 +843,10 @@ async function loadMeetingSubscriptions(): Promise<void> {
 }
 
 async function saveMeetingSubscriptions(): Promise<void> {
-  const directory = dirname(meetingSubscriptionFile);
-  const temporaryFile = `${meetingSubscriptionFile}.tmp`;
-  await mkdir(directory, { recursive: true });
-  await writeFile(temporaryFile, JSON.stringify([...meetingSubscriptionChatIds]), "utf8");
-  await rename(temporaryFile, meetingSubscriptionFile);
+  const subscriptions = Object.fromEntries(
+    [...meetingSubscriptionChatIds].map((chatId) => [String(chatId), meetingSubscriptions.get(chatId) ?? { title: `Group ${chatId}`, project: null }]),
+  );
+  await saveJsonFile(meetingSubscriptionFile, { subscriptions });
 }
 
 async function loadDailySummaryState(): Promise<void> {
@@ -869,6 +941,30 @@ function parseStoredChatIds(value: unknown): Set<number> {
   return new Set(value.filter((chatId): chatId is number => Number.isSafeInteger(chatId) && chatId !== 0));
 }
 
+function parseMeetingSubscriptions(value: unknown): Map<number, MeetingSubscription> {
+  if (Array.isArray(value)) {
+    return new Map(
+      [...parseStoredChatIds(value)].map((chatId) => [chatId, { title: `Group ${chatId}`, project: null }]),
+    );
+  }
+
+  if (typeof value !== "object" || value === null || !("subscriptions" in value) || typeof value.subscriptions !== "object" || value.subscriptions === null) {
+    throw new Error("Meeting subscriptions are invalid");
+  }
+
+  const subscriptions = new Map<number, MeetingSubscription>();
+  for (const [chatId, subscription] of Object.entries(value.subscriptions)) {
+    const numericChatId = Number(chatId);
+    if (!Number.isSafeInteger(numericChatId) || numericChatId === 0 || typeof subscription !== "object" || subscription === null) {
+      continue;
+    }
+    const title = "title" in subscription && typeof subscription.title === "string" ? subscription.title : `Group ${numericChatId}`;
+    const project = "project" in subscription && typeof subscription.project === "string" ? subscription.project : null;
+    subscriptions.set(numericChatId, { title, project });
+  }
+  return subscriptions;
+}
+
 function parseMeetingSummaryState(value: unknown): Map<string, MeetingSummarySpace> {
   if (typeof value !== "object" || value === null || !("spaces" in value) || typeof value.spaces !== "object" || value.spaces === null) {
     throw new Error("Meeting summary state is invalid");
@@ -884,7 +980,13 @@ function parseMeetingSummaryState(value: unknown): Map<string, MeetingSummarySpa
       "summarySent" in meeting &&
       typeof meeting.summarySent === "boolean"
     ) {
-      spaces.set(spaceName, { createdAt: meeting.createdAt, summarySent: meeting.summarySent });
+      spaces.set(spaceName, {
+        createdAt: meeting.createdAt,
+        summarySent: meeting.summarySent,
+        attendanceSent: "attendanceSent" in meeting && meeting.attendanceSent === true,
+        groupTitle: "groupTitle" in meeting && typeof meeting.groupTitle === "string" ? meeting.groupTitle : null,
+        project: "project" in meeting && typeof meeting.project === "string" ? meeting.project : null,
+      });
     }
   }
 
@@ -939,10 +1041,15 @@ function parseDailySummaryState(value: unknown): Map<number, DailySummaryGroupSt
   return groups;
 }
 
-async function getMeetingUrlForAnnouncement(): Promise<string | undefined> {
+function getMeetingContext(chatId: number): MeetingContext {
+  const subscription = meetingSubscriptions.get(chatId);
+  return { chatId, groupTitle: subscription?.title ?? `Group ${chatId}`, project: subscription?.project ?? null };
+}
+
+async function getMeetingUrlForAnnouncement(context: MeetingContext): Promise<string | undefined> {
   if (hasGoogleMeetAccess()) {
     try {
-      return await createGoogleMeet();
+      return await createGoogleMeet(context);
     } catch (error) {
       console.error("Scheduled Google Meet creation failed; using fallback link when available", error);
     }
@@ -951,7 +1058,7 @@ async function getMeetingUrlForAnnouncement(): Promise<string | undefined> {
   return meetingUrl;
 }
 
-async function createGoogleMeet(): Promise<string> {
+async function createGoogleMeet(context?: MeetingContext): Promise<string> {
   if (!hasGoogleMeetAccess()) {
     throw new Error("Google Meet credentials are not configured");
   }
@@ -977,7 +1084,7 @@ async function createGoogleMeet(): Promise<string> {
   }
 
   if (payload.name) {
-    await trackMeetingForSummary(payload.name);
+    await trackMeetingForSummary(payload.name, context);
   }
 
   console.log("Google Meet created", {
@@ -1023,7 +1130,7 @@ async function getGoogleApiErrorMessage(response: Response): Promise<string | un
   }
 }
 
-async function trackMeetingForSummary(spaceName: string): Promise<void> {
+async function trackMeetingForSummary(spaceName: string, context?: MeetingContext): Promise<void> {
   if (meetingSummaryChatIds.size === 0 || meetingSummarySpaces.has(spaceName)) {
     console.log("Meeting transcript tracking skipped", {
       spaceName,
@@ -1033,7 +1140,13 @@ async function trackMeetingForSummary(spaceName: string): Promise<void> {
     return;
   }
 
-  meetingSummarySpaces.set(spaceName, { createdAt: new Date().toISOString(), summarySent: false });
+  meetingSummarySpaces.set(spaceName, {
+    createdAt: new Date().toISOString(),
+    summarySent: false,
+    attendanceSent: false,
+    groupTitle: context?.groupTitle ?? null,
+    project: context?.project ?? null,
+  });
   try {
     await saveMeetingSummaryState();
     console.log("Meeting transcript tracking saved", { spaceName });
@@ -1054,7 +1167,7 @@ function scheduleMeetingSummaryChecks(): void {
 }
 
 async function checkMeetingSummaries(): Promise<void> {
-  if (isMeetingSummaryCheckRunning || meetingSummaryChatIds.size === 0 || !hasGoogleMeetAccess() || !hasGeminiAccess()) {
+  if (isMeetingSummaryCheckRunning || meetingSummaryChatIds.size === 0 || !hasGoogleMeetAccess()) {
     console.log("Meeting transcript check skipped", {
       alreadyRunning: isMeetingSummaryCheckRunning,
       summaryDestinations: meetingSummaryChatIds.size,
@@ -1083,7 +1196,36 @@ async function checkMeetingSummaries(): Promise<void> {
       }
 
       console.log("Meeting transcript status requested", { spaceName, createdAt: meeting.createdAt });
-      const transcript = await getGeneratedMeetingTranscript(spaceName, accessToken);
+      const conference = await getMeetingConference(spaceName, accessToken);
+      if (!conference?.name || !conference.endTime) {
+        continue;
+      }
+
+      if (!meeting.attendanceSent) {
+        try {
+          const participants = await getMeetingParticipants(conference.name, accessToken);
+          const attendanceText = formatMeetingAttendance(meeting, participants);
+          const results = await Promise.allSettled(
+            [...meetingSummaryChatIds].map((chatId) => bot.telegram.sendMessage(chatId, attendanceText)),
+          );
+          const failed = results.find((result) => result.status === "rejected");
+          if (failed) {
+            console.error("Meeting attendance notification failed", failed.reason);
+          } else {
+            meeting.attendanceSent = true;
+            stateChanged = true;
+            console.log("Meeting attendance sent", { spaceName, participantCount: participants.length });
+          }
+        } catch (error) {
+          console.error("Meeting attendance collection failed", { spaceName, conferenceName: conference.name, error });
+        }
+      }
+
+      if (meeting.summarySent || !hasGeminiAccess()) {
+        continue;
+      }
+
+      const transcript = await getGeneratedMeetingTranscript(conference.name, spaceName, accessToken);
       if (!transcript) {
         console.log("Meeting transcript is not ready yet", { spaceName });
         continue;
@@ -1103,8 +1245,9 @@ async function checkMeetingSummaries(): Promise<void> {
       }
 
       console.log("Meeting summary generated", { spaceName, characters: summary.length, destinations: meetingSummaryChatIds.size });
+      const heading = [meeting.groupTitle, meeting.project].filter(Boolean).join(" / ");
       const results = await Promise.allSettled(
-        [...meetingSummaryChatIds].map((chatId) => bot.telegram.sendMessage(chatId, `Итог созвона\n${summary}`)),
+        [...meetingSummaryChatIds].map((chatId) => bot.telegram.sendMessage(chatId, `${heading ? `Итог созвона: ${heading}` : "Итог созвона"}\n${summary}`)),
       );
       const failed = results.find((result) => result.status === "rejected");
       if (failed) {
@@ -1127,7 +1270,7 @@ async function checkMeetingSummaries(): Promise<void> {
   }
 }
 
-async function getGeneratedMeetingTranscript(spaceName: string, accessToken: string): Promise<MeetTranscript | undefined> {
+async function getMeetingConference(spaceName: string, accessToken: string): Promise<MeetConferenceRecord | undefined> {
   const query = new URLSearchParams({
     pageSize: "10",
     filter: `space.name = "${spaceName}"`,
@@ -1143,16 +1286,48 @@ async function getGeneratedMeetingTranscript(spaceName: string, accessToken: str
     return undefined;
   }
 
-  const transcripts = await fetchMeetJson<MeetTranscriptsResponse>(`/v2/${conference.name}/transcripts?pageSize=10`, accessToken);
+  return conference;
+}
+
+async function getGeneratedMeetingTranscript(conferenceName: string, spaceName: string, accessToken: string): Promise<MeetTranscript | undefined> {
+  const transcripts = await fetchMeetJson<MeetTranscriptsResponse>(`/v2/${conferenceName}/transcripts?pageSize=10`, accessToken);
   const transcript = transcripts.transcripts?.find((item) => item.state === "FILE_GENERATED");
   console.log("Meeting transcript artifacts checked", {
     spaceName,
-    conferenceName: conference.name,
+    conferenceName,
     transcriptCount: transcripts.transcripts?.length ?? 0,
     transcriptStates: transcripts.transcripts?.map((item) => item.state ?? "UNKNOWN") ?? [],
     generated: Boolean(transcript),
   });
   return transcript;
+}
+
+async function getMeetingParticipants(conferenceName: string, accessToken: string): Promise<MeetingParticipant[]> {
+  let pageToken: string | undefined;
+  const participants: MeetingParticipant[] = [];
+  do {
+    const query = new URLSearchParams({ pageSize: "250" });
+    if (pageToken) {
+      query.set("pageToken", pageToken);
+    }
+    const page = await fetchMeetJson<MeetParticipantsResponse>(`/v2/${conferenceName}/participants?${query}`, accessToken);
+    participants.push(...(page.participants ?? []));
+    pageToken = page.nextPageToken;
+  } while (pageToken);
+  return participants;
+}
+
+function formatMeetingAttendance(meeting: MeetingSummarySpace, participants: MeetingParticipant[]): string {
+  const heading = [meeting.groupTitle, meeting.project].filter(Boolean).join(" / ") || "Созвон";
+  const names = participants
+    .map((participant) => participant.signedinUser?.displayName ?? participant.anonymousUser?.displayName ?? participant.phoneUser?.displayName ?? null)
+    .filter((name): name is string => Boolean(name))
+    .filter((name, index, values) => values.indexOf(name) === index);
+
+  return [
+    `Участники созвона: ${heading}`,
+    names.length > 0 ? names.map((name) => `• ${name}`).join("\n") : "Google Meet не передал список участников.",
+  ].join("\n");
 }
 
 async function getMeetingTranscriptText(transcriptName: string, accessToken: string): Promise<string | undefined> {
@@ -1308,6 +1483,14 @@ function formatMoscowHour(hour: number): string {
   return `${String(hour).padStart(2, "0")}:00`;
 }
 
+function getCommandArgument(text: string, command: string): string {
+  return text.replace(new RegExp(`^/${command}(?:@\\w+)?\\s*`, "i"), "").trim();
+}
+
+function getChatTitle(chat: { id: number; title?: string; username?: string }): string {
+  return chat.title?.trim() || chat.username?.trim() || `Group ${chat.id}`;
+}
+
 function getMoscowDateKey(date: Date): string {
   const { year, month, day } = getMoscowDateParts(date);
   return [year, String(month).padStart(2, "0"), String(day).padStart(2, "0")].join("-");
@@ -1385,11 +1568,25 @@ type GoogleMeetSpace = {
 type MeetingSummarySpace = {
   createdAt: string;
   summarySent: boolean;
+  attendanceSent: boolean;
+  groupTitle: string | null;
+  project: string | null;
 };
 
 type ScheduledMeeting = {
   startsAt: string;
-  url: string;
+  urls: Map<number, string>;
+};
+
+type MeetingSubscription = {
+  title: string;
+  project: string | null;
+};
+
+type MeetingContext = {
+  chatId: number;
+  groupTitle: string;
+  project: string | null;
 };
 
 type DailySummaryMessage = {
@@ -1408,10 +1605,23 @@ type DailySummaryGroupState = {
 };
 
 type MeetConferenceRecordsResponse = {
-  conferenceRecords?: Array<{
-    name?: string;
-    endTime?: string;
-  }>;
+  conferenceRecords?: MeetConferenceRecord[];
+};
+
+type MeetConferenceRecord = {
+  name?: string;
+  endTime?: string;
+};
+
+type MeetParticipantsResponse = {
+  participants?: MeetingParticipant[];
+  nextPageToken?: string;
+};
+
+type MeetingParticipant = {
+  signedinUser?: { displayName?: string };
+  anonymousUser?: { displayName?: string };
+  phoneUser?: { displayName?: string };
 };
 
 type MeetTranscriptsResponse = {
