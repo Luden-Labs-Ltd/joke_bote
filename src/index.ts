@@ -5,8 +5,10 @@ import { createServer } from "node:http";
 import type { IncomingMessage } from "node:http";
 import { dirname } from "node:path";
 import { Context, Markup, Telegraf } from "telegraf";
+import { captureException, initSentry } from "./sentry.js";
 
 dotenv.config();
+initSentry();
 
 const token = process.env.BOT_TOKEN;
 
@@ -377,10 +379,14 @@ bot.on("text", async (ctx, next) => {
 });
 
 bot.catch((error) => {
+  captureException(error, "telegram.update");
   console.error("Bot error", error);
 });
 
-void initializeManagerBot();
+void initializeManagerBot().catch((error: unknown) => {
+  captureException(error, "manager.initialize");
+  console.error("Manager bot initialization failed", error);
+});
 
 async function initializeManagerBot(): Promise<void> {
   await loadMeetingSubscriptions();
@@ -390,6 +396,7 @@ async function initializeManagerBot(): Promise<void> {
   // Telegraf's polling promise stays pending for the lifetime of the bot.
   // Do not await it here: the schedulers below must start alongside polling.
   void bot.launch().catch((error: unknown) => {
+    captureException(error, "telegram.polling");
     console.error("Telegram polling failed; GitHub webhook server will stay online", error);
   });
 
@@ -433,6 +440,7 @@ function startGitHubWebhookServer(): void {
       response.writeHead(202).end("Accepted");
       void announceGitHubPush(payload);
     } catch (error) {
+      captureException(error, "github.webhook");
       console.error("GitHub webhook handling failed", error);
       if (!response.headersSent) {
         response.writeHead(400).end("Invalid webhook payload");
