@@ -4,7 +4,7 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { IncomingMessage } from "node:http";
 import { dirname } from "node:path";
-import { Context, Telegraf } from "telegraf";
+import { Context, Markup, Telegraf } from "telegraf";
 
 dotenv.config();
 
@@ -33,9 +33,7 @@ const geminiApiKey = process.env.GEMINI_API_KEY?.trim();
 const geminiModel = process.env.GEMINI_MODEL?.trim() || "gemini-2.5-flash";
 const port = Number(process.env.WEBHOOK_PORT) || 3000;
 const meetingMessage = process.env.MEETING_MESSAGE?.trim() || "Созвон начинаем в 10:30 МСК. Ссылка на Google Meet:";
-const meetingDays = new Set([1, 2, 3, 4]);
-const meetingHourMoscow = 10;
-const meetingMinuteMoscow = 30;
+const defaultMeetingSchedule: MeetingSchedule = { time: "10:30", days: [1, 2, 3, 4] };
 const moscowUtcOffsetHours = 3;
 const meetingSummaryPollIntervalMs = 5 * 60 * 1000;
 const maxMeetingTranscriptCharacters = 60_000;
@@ -49,7 +47,7 @@ const maxDailySummaryCharacters = 60_000;
 const helpText = [
   "Я manager-бот: по понедельникам–четвергам в 10:30 МСК присылаю ссылку на общий созвон.",
   "",
-  "/startmeet [проект] — подключить эту группу к расписанию отдельных созвонов (для администратора)",
+  "/startmeet [проект] — настроить расписание созвонов этой группы (для администратора)",
   "/stopmeet — отключить эту группу от расписания (для администратора)",
   "/newmeet — создать новую ссылку Google Meet (для администратора группы)",
   "/startsummary [проект] — включить ежедневную сводку переписки этой группы (для администратора)",
@@ -61,10 +59,12 @@ const helpText = [
 const bot = new Telegraf(token);
 const meetingSubscriptionChatIds = new Set<number>(targetChatIds);
 const meetingSubscriptions = new Map<number, MeetingSubscription>();
+const meetingSetupSessions = new Map<string, MeetingSetupSession>();
+const meetingScheduleTimers = new Map<number, MeetingScheduleTimers>();
 const meetingSummarySpaces = new Map<string, MeetingSummarySpace>();
 const dailySummarySubscriptionChatIds = new Set<number>();
 const dailySummaryState = new Map<number, DailySummaryGroupState>();
-let nextScheduledMeeting: ScheduledMeeting | undefined;
+const scheduledMeetingLinks = new Map<string, string>();
 let isMeetingSummaryCheckRunning = false;
 let isDailySummaryRunning = false;
 
@@ -103,35 +103,18 @@ bot.command("startmeet", async (ctx) => {
     return;
   }
 
-  const isNewSubscription = !meetingSubscriptionChatIds.has(ctx.chat.id);
-  const previousSubscription = meetingSubscriptions.get(ctx.chat.id);
-  const project = getCommandArgument(ctx.message.text, "startmeet");
-  const subscription: MeetingSubscription = {
+  const existing = meetingSubscriptions.get(ctx.chat.id);
+  const project = getCommandArgument(ctx.message.text, "startmeet") || existing?.project || null;
+  const session: MeetingSetupSession = {
+    chatId: ctx.chat.id,
+    userId: ctx.from!.id,
     title: getChatTitle(ctx.chat),
-    project: project || null,
+    project,
+    schedule: { ...(existing?.schedule ?? defaultMeetingSchedule), days: [...(existing?.schedule.days ?? defaultMeetingSchedule.days)] },
+    stage: "time",
   };
-  meetingSubscriptionChatIds.add(ctx.chat.id);
-  meetingSubscriptions.set(ctx.chat.id, subscription);
-
-  try {
-    await saveMeetingSubscriptions();
-    await ctx.reply(
-      isNewSubscription
-        ? `Группа подключена: для «${subscription.title}» будут создаваться отдельные ссылки Google Meet с понедельника по четверг в 10:30 МСК.${subscription.project ? ` Проект: ${subscription.project}.` : ""}`
-        : `Настройки созвонов обновлены.${subscription.project ? ` Проект: ${subscription.project}.` : ""}`,
-    );
-  } catch (error) {
-    if (isNewSubscription) {
-      meetingSubscriptionChatIds.delete(ctx.chat.id);
-    }
-    if (previousSubscription) {
-      meetingSubscriptions.set(ctx.chat.id, previousSubscription);
-    } else {
-      meetingSubscriptions.delete(ctx.chat.id);
-    }
-    console.error("Meeting subscription could not be saved", { chatId: ctx.chat.id, error });
-    await ctx.reply("Не смог сохранить подписку на созвоны. Проверьте хранилище бота.");
-  }
+  meetingSetupSessions.set(getMeetingSetupSessionKey(session.chatId, session.userId), session);
+  await ctx.reply("Когда присылать ссылку? Время — МСК.", getMeetingTimeKeyboard());
 });
 
 bot.command("stopmeet", async (ctx) => {
@@ -148,6 +131,7 @@ bot.command("stopmeet", async (ctx) => {
   meetingSubscriptionChatIds.delete(ctx.chat.id);
   const previousSubscription = meetingSubscriptions.get(ctx.chat.id);
   meetingSubscriptions.delete(ctx.chat.id);
+  clearMeetingSchedule(ctx.chat.id);
 
   try {
     await saveMeetingSubscriptions();
@@ -157,8 +141,81 @@ bot.command("stopmeet", async (ctx) => {
     if (previousSubscription) {
       meetingSubscriptions.set(ctx.chat.id, previousSubscription);
     }
+    rescheduleMeetingChat(ctx.chat.id);
     console.error("Meeting subscription could not be removed", { chatId: ctx.chat.id, error });
     await ctx.reply("Не смог сохранить изменение. Проверьте хранилище бота.");
+  }
+});
+
+bot.action(/^meet:time:(\d{2}:\d{2})$/, async (ctx) => {
+  const session = getMeetingSetupSession(ctx.chat?.id, ctx.from?.id);
+  if (!session) {
+    await ctx.answerCbQuery("Настройка устарела. Запустите /startmeet ещё раз.");
+    return;
+  }
+
+  session.schedule.time = ctx.match[1];
+  session.stage = "days";
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(formatMeetingDaysPrompt(session), getMeetingDaysKeyboard(session));
+});
+
+bot.action("meet:time:custom", async (ctx) => {
+  const session = getMeetingSetupSession(ctx.chat?.id, ctx.from?.id);
+  if (!session) {
+    await ctx.answerCbQuery("Настройка устарела. Запустите /startmeet ещё раз.");
+    return;
+  }
+
+  session.stage = "custom-time";
+  await ctx.answerCbQuery();
+  await ctx.editMessageText("Напишите время одним сообщением в формате HH:MM, например 13:15. Время — МСК.");
+});
+
+bot.action(/^meet:day:(\d)$/, async (ctx) => {
+  const session = getMeetingSetupSession(ctx.chat?.id, ctx.from?.id);
+  const day = Number(ctx.match[1]);
+  if (!session || !Number.isInteger(day) || day < 1 || day > 7) {
+    await ctx.answerCbQuery("Настройка устарела. Запустите /startmeet ещё раз.");
+    return;
+  }
+
+  session.schedule.days = session.schedule.days.includes(day)
+    ? session.schedule.days.filter((value) => value !== day)
+    : [...session.schedule.days, day].sort((left, right) => left - right);
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(formatMeetingDaysPrompt(session), getMeetingDaysKeyboard(session));
+});
+
+bot.action("meet:save", async (ctx) => {
+  const session = getMeetingSetupSession(ctx.chat?.id, ctx.from?.id);
+  if (!session) {
+    await ctx.answerCbQuery("Настройка устарела. Запустите /startmeet ещё раз.");
+    return;
+  }
+  if (session.schedule.days.length === 0) {
+    await ctx.answerCbQuery("Выберите хотя бы один день.");
+    return;
+  }
+
+  const subscription: MeetingSubscription = {
+    title: session.title,
+    project: session.project,
+    schedule: { time: session.schedule.time, days: [...session.schedule.days] },
+  };
+  meetingSubscriptionChatIds.add(session.chatId);
+  meetingSubscriptions.set(session.chatId, subscription);
+  try {
+    await saveMeetingSubscriptions();
+    rescheduleMeetingChat(session.chatId);
+    meetingSetupSessions.delete(getMeetingSetupSessionKey(session.chatId, session.userId));
+    await ctx.answerCbQuery("Расписание сохранено.");
+    await ctx.editMessageText(
+      `Готово: «${subscription.title}»${subscription.project ? ` / ${subscription.project}` : ""}.\nСсылка будет приходить в ${subscription.schedule.time} МСК: ${formatMeetingDays(subscription.schedule.days)}.`,
+    );
+  } catch (error) {
+    console.error("Meeting subscription could not be saved", { chatId: session.chatId, error });
+    await ctx.answerCbQuery("Не удалось сохранить расписание.");
   }
 });
 
@@ -288,6 +345,19 @@ bot.on("text", async (ctx, next) => {
   await next();
 
   const message = ctx.message;
+  const setupSession = getMeetingSetupSession(ctx.chat.id, ctx.from?.id);
+  if (setupSession?.stage === "custom-time" && ctx.from && !ctx.from.is_bot && !message.text.startsWith("/")) {
+    const time = parseMeetingTime(message.text);
+    if (!time) {
+      await ctx.reply("Не понял время. Напишите в формате HH:MM, например 13:15.");
+      return;
+    }
+    setupSession.schedule.time = time;
+    setupSession.stage = "days";
+    await ctx.reply(formatMeetingDaysPrompt(setupSession), getMeetingDaysKeyboard(setupSession));
+    return;
+  }
+
   if (
     !message ||
     !ctx.from ||
@@ -324,7 +394,7 @@ async function initializeManagerBot(): Promise<void> {
   });
 
   console.log("Manager bot is starting", { botUsername: process.env.BOT_USERNAME || null });
-  scheduleNextMeetingAnnouncement();
+  scheduleAllMeetingAnnouncements();
   scheduleMeetingTestAnnouncement();
   scheduleMeetingSummaryChecks();
   scheduleNextDailySummary();
@@ -696,24 +766,44 @@ function escapeHtml(value: string): string {
   return value.replace(/[&<>\"]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[character]!);
 }
 
-function scheduleNextMeetingAnnouncement(): void {
-  const startsAt = getNextMeetingRunAt(new Date());
+function scheduleAllMeetingAnnouncements(): void {
+  meetingSubscriptionChatIds.forEach((chatId) => rescheduleMeetingChat(chatId));
+}
+
+function clearMeetingSchedule(chatId: number): void {
+  const timers = meetingScheduleTimers.get(chatId);
+  if (timers) {
+    clearTimeout(timers.reminder);
+    clearTimeout(timers.start);
+    meetingScheduleTimers.delete(chatId);
+  }
+}
+
+function rescheduleMeetingChat(chatId: number): void {
+  clearMeetingSchedule(chatId);
+  if (!meetingSubscriptionChatIds.has(chatId)) {
+    return;
+  }
+
+  const startsAt = getNextMeetingRunAt(new Date(), getMeetingContext(chatId).schedule);
   const reminderAt = new Date(startsAt.getTime() - meetingReminderLeadMinutes * 60 * 1000);
   const reminderDelayMs = Math.max(0, reminderAt.getTime() - Date.now());
   const startDelayMs = startsAt.getTime() - Date.now();
 
-  console.log("Next meeting reminders scheduled", {
+  console.log("Next group meeting scheduled", {
+    chatId,
     reminderAt: reminderAt.toISOString(),
     startsAt: startsAt.toISOString(),
     reminderDelayMs,
     startDelayMs,
   });
 
-  setTimeout(() => void announceUpcomingMeeting(startsAt), reminderDelayMs);
-  setTimeout(async () => {
-    await announceMeetingStart(startsAt);
-    scheduleNextMeetingAnnouncement();
+  const reminder = setTimeout(() => void announceUpcomingMeeting(chatId, startsAt), reminderDelayMs);
+  const start = setTimeout(async () => {
+    await announceMeetingStart(chatId, startsAt);
+    rescheduleMeetingChat(chatId);
   }, startDelayMs);
+  meetingScheduleTimers.set(chatId, { reminder, start });
 }
 
 function scheduleMeetingTestAnnouncement(): void {
@@ -738,11 +828,13 @@ function scheduleMeetingTestAnnouncement(): void {
     startsAt: startsAt.toISOString(),
   });
 
-  setTimeout(() => void announceUpcomingMeeting(startsAt), Math.max(0, reminderAt.getTime() - Date.now()));
-  setTimeout(() => void announceMeetingStart(startsAt), startsAt.getTime() - Date.now());
+  for (const chatId of meetingSubscriptionChatIds) {
+    setTimeout(() => void announceUpcomingMeeting(chatId, startsAt), Math.max(0, reminderAt.getTime() - Date.now()));
+    setTimeout(() => void announceMeetingStart(chatId, startsAt), startsAt.getTime() - Date.now());
+  }
 }
 
-function getNextMeetingRunAt(now: Date): Date {
+function getNextMeetingRunAt(now: Date, schedule: MeetingSchedule): Date {
   const moscowNow = getMoscowDateParts(now);
   const firstCandidate = new Date(Date.UTC(moscowNow.year, moscowNow.month - 1, moscowNow.day));
 
@@ -750,17 +842,19 @@ function getNextMeetingRunAt(now: Date): Date {
     const candidateDate = new Date(firstCandidate);
     candidateDate.setUTCDate(candidateDate.getUTCDate() + offset);
 
-    if (!meetingDays.has(candidateDate.getUTCDay())) {
+    if (!schedule.days.includes(candidateDate.getUTCDay())) {
       continue;
     }
+
+    const [hour, minute] = schedule.time.split(":").map(Number);
 
     const candidate = new Date(
       Date.UTC(
         candidateDate.getUTCFullYear(),
         candidateDate.getUTCMonth(),
         candidateDate.getUTCDate(),
-        meetingHourMoscow - moscowUtcOffsetHours,
-        meetingMinuteMoscow,
+        hour - moscowUtcOffsetHours,
+        minute,
       ),
     );
 
@@ -772,76 +866,48 @@ function getNextMeetingRunAt(now: Date): Date {
   throw new Error("Could not calculate the next meeting announcement time");
 }
 
-async function announceUpcomingMeeting(startsAt: Date): Promise<void> {
-  if (meetingSubscriptionChatIds.size === 0) {
-    console.warn("Meeting reminder skipped: no groups are subscribed");
+async function announceUpcomingMeeting(chatId: number, startsAt: Date): Promise<void> {
+  if (!meetingSubscriptionChatIds.has(chatId)) {
     return;
   }
 
-  const meetings = await createScheduledMeetings();
-  if (meetings.size === 0) {
+  const url = await getMeetingUrlForAnnouncement(getMeetingContext(chatId));
+  if (!url) {
     console.warn("Meeting reminder skipped: no Google Meet access and MEETING_URL is empty");
     return;
   }
 
-  nextScheduledMeeting = { startsAt: startsAt.toISOString(), urls: meetings };
-  await sendScheduledMeetingMessages(meetings, meetingReminderMessage, "Meeting reminder");
+  scheduledMeetingLinks.set(getScheduledMeetingKey(chatId, startsAt), url);
+  await sendScheduledMeetingMessage(chatId, `${meetingReminderMessage}\n${url}`, "Meeting reminder");
 }
 
-async function announceMeetingStart(startsAt: Date): Promise<void> {
-  if (meetingSubscriptionChatIds.size === 0) {
-    console.warn("Meeting start announcement skipped: no groups are subscribed");
+async function announceMeetingStart(chatId: number, startsAt: Date): Promise<void> {
+  if (!meetingSubscriptionChatIds.has(chatId)) {
     return;
   }
 
-  const scheduledMeeting = nextScheduledMeeting;
-  const meetings = scheduledMeeting?.startsAt === startsAt.toISOString()
-    ? scheduledMeeting.urls
-    : await createScheduledMeetings();
-
-  nextScheduledMeeting = undefined;
-
-  if (meetings.size === 0) {
+  const key = getScheduledMeetingKey(chatId, startsAt);
+  const url = scheduledMeetingLinks.get(key) ?? await getMeetingUrlForAnnouncement(getMeetingContext(chatId));
+  scheduledMeetingLinks.delete(key);
+  if (!url) {
     console.warn("Meeting start announcement skipped: no Google Meet access and MEETING_URL is empty");
     return;
   }
 
-  await sendScheduledMeetingMessages(meetings, meetingStartMessage, "Meeting start announcement");
+  await sendScheduledMeetingMessage(chatId, `${meetingStartMessage}\n${url}`, "Meeting start announcement");
 }
 
-async function createScheduledMeetings(): Promise<Map<number, string>> {
-  const chatIds = [...meetingSubscriptionChatIds];
-  const results = await Promise.allSettled(
-    chatIds.map(async (chatId) => [chatId, await getMeetingUrlForAnnouncement(getMeetingContext(chatId))] as const),
-  );
-  const meetings = new Map<number, string>();
-
-  results.forEach((result, index) => {
-    const chatId = chatIds[index];
-    if (result.status === "fulfilled" && result.value[1]) {
-      meetings.set(chatId, result.value[1]);
-      return;
-    }
-    console.error("Scheduled Google Meet creation failed for group", { chatId, error: result.status === "rejected" ? result.reason : null });
-  });
-  return meetings;
+function getScheduledMeetingKey(chatId: number, startsAt: Date): string {
+  return `${chatId}:${startsAt.toISOString()}`;
 }
 
-async function sendScheduledMeetingMessages(meetings: Map<number, string>, text: string, logPrefix: string): Promise<void> {
-  const entries = [...meetings];
-  const results = await Promise.allSettled(
-    entries.map(([chatId, url]) => bot.telegram.sendMessage(chatId, `${text}\n${url}`)),
-  );
-
-  results.forEach((result, index) => {
-    const [chatId] = entries[index];
-    if (result.status === "fulfilled") {
-      console.log(`${logPrefix} sent`, { chatId });
-      return;
-    }
-
-    console.error(`${logPrefix} failed`, { chatId, error: result.reason });
-  });
+async function sendScheduledMeetingMessage(chatId: number, text: string, logPrefix: string): Promise<void> {
+  try {
+    await bot.telegram.sendMessage(chatId, text);
+    console.log(`${logPrefix} sent`, { chatId });
+  } catch (error) {
+    console.error(`${logPrefix} failed`, { chatId, error });
+  }
 }
 
 async function loadMeetingSubscriptions(): Promise<void> {
@@ -865,7 +931,7 @@ async function loadMeetingSubscriptions(): Promise<void> {
 
 async function saveMeetingSubscriptions(): Promise<void> {
   const subscriptions = Object.fromEntries(
-    [...meetingSubscriptionChatIds].map((chatId) => [String(chatId), meetingSubscriptions.get(chatId) ?? { title: `Group ${chatId}`, project: null }]),
+    [...meetingSubscriptionChatIds].map((chatId) => [String(chatId), meetingSubscriptions.get(chatId) ?? { title: `Group ${chatId}`, project: null, schedule: defaultMeetingSchedule }]),
   );
   await saveJsonFile(meetingSubscriptionFile, { subscriptions });
 }
@@ -965,7 +1031,7 @@ function parseStoredChatIds(value: unknown): Set<number> {
 function parseMeetingSubscriptions(value: unknown): Map<number, MeetingSubscription> {
   if (Array.isArray(value)) {
     return new Map(
-      [...parseStoredChatIds(value)].map((chatId) => [chatId, { title: `Group ${chatId}`, project: null }]),
+      [...parseStoredChatIds(value)].map((chatId) => [chatId, { title: `Group ${chatId}`, project: null, schedule: defaultMeetingSchedule }]),
     );
   }
 
@@ -981,9 +1047,19 @@ function parseMeetingSubscriptions(value: unknown): Map<number, MeetingSubscript
     }
     const title = "title" in subscription && typeof subscription.title === "string" ? subscription.title : `Group ${numericChatId}`;
     const project = "project" in subscription && typeof subscription.project === "string" ? subscription.project : null;
-    subscriptions.set(numericChatId, { title, project });
+    const schedule = "schedule" in subscription ? parseMeetingSchedule(subscription.schedule) : defaultMeetingSchedule;
+    subscriptions.set(numericChatId, { title, project, schedule });
   }
   return subscriptions;
+}
+
+function parseMeetingSchedule(value: unknown): MeetingSchedule {
+  if (typeof value !== "object" || value === null || !("time" in value) || !("days" in value) || typeof value.time !== "string" || !Array.isArray(value.days)) {
+    return defaultMeetingSchedule;
+  }
+  const time = parseMeetingTime(value.time);
+  const days = [...new Set(value.days.filter((day): day is number => Number.isInteger(day) && day >= 1 && day <= 7))].sort((left, right) => left - right);
+  return time && days.length > 0 ? { time, days } : defaultMeetingSchedule;
 }
 
 function parseMeetingSummaryState(value: unknown): Map<string, MeetingSummarySpace> {
@@ -1064,7 +1140,12 @@ function parseDailySummaryState(value: unknown): Map<number, DailySummaryGroupSt
 
 function getMeetingContext(chatId: number): MeetingContext {
   const subscription = meetingSubscriptions.get(chatId);
-  return { chatId, groupTitle: subscription?.title ?? `Group ${chatId}`, project: subscription?.project ?? null };
+  return {
+    chatId,
+    groupTitle: subscription?.title ?? `Group ${chatId}`,
+    project: subscription?.project ?? null,
+    schedule: subscription?.schedule ?? defaultMeetingSchedule,
+  };
 }
 
 async function getMeetingUrlForAnnouncement(context: MeetingContext): Promise<string | undefined> {
@@ -1528,6 +1609,52 @@ function getCommandArgument(text: string, command: string): string {
   return text.replace(new RegExp(`^/${command}(?:@\\w+)?\\s*`, "i"), "").trim();
 }
 
+function getMeetingSetupSessionKey(chatId: number, userId: number): string {
+  return `${chatId}:${userId}`;
+}
+
+function getMeetingSetupSession(chatId: number | undefined, userId: number | undefined): MeetingSetupSession | undefined {
+  return chatId && userId ? meetingSetupSessions.get(getMeetingSetupSessionKey(chatId, userId)) : undefined;
+}
+
+function getMeetingTimeKeyboard() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("09:00", "meet:time:09:00"), Markup.button.callback("10:00", "meet:time:10:00"), Markup.button.callback("10:30", "meet:time:10:30")],
+    [Markup.button.callback("11:00", "meet:time:11:00"), Markup.button.callback("12:00", "meet:time:12:00"), Markup.button.callback("Своё время", "meet:time:custom")],
+  ]);
+}
+
+function getMeetingDaysKeyboard(session: MeetingSetupSession) {
+  const dayNames = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"];
+  return Markup.inlineKeyboard([
+    dayNames.map((name, index) => {
+      const day = index + 1;
+      return Markup.button.callback(`${session.schedule.days.includes(day) ? "✓ " : ""}${name}`, `meet:day:${day}`);
+    }),
+    [Markup.button.callback("Сохранить", "meet:save")],
+  ]);
+}
+
+function formatMeetingDaysPrompt(session: MeetingSetupSession): string {
+  return `Время: ${session.schedule.time} МСК. Выберите дни и нажмите «Сохранить».`;
+}
+
+function formatMeetingDays(days: number[]): string {
+  return days.map((day) => ["", "Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"][day]).join(", ");
+}
+
+function parseMeetingTime(value: string): string | undefined {
+  const match = /^(\d{1,2}):(\d{2})$/.exec(value.trim());
+  if (!match) {
+    return undefined;
+  }
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  return hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59
+    ? `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`
+    : undefined;
+}
+
 function getChatTitle(chat: { id: number; title?: string; username?: string }): string {
   return chat.title?.trim() || chat.username?.trim() || `Group ${chat.id}`;
 }
@@ -1614,20 +1741,36 @@ type MeetingSummarySpace = {
   project: string | null;
 };
 
-type ScheduledMeeting = {
-  startsAt: string;
-  urls: Map<number, string>;
-};
-
 type MeetingSubscription = {
   title: string;
   project: string | null;
+  schedule: MeetingSchedule;
 };
 
 type MeetingContext = {
   chatId: number;
   groupTitle: string;
   project: string | null;
+  schedule: MeetingSchedule;
+};
+
+type MeetingSchedule = {
+  time: string;
+  days: number[];
+};
+
+type MeetingSetupSession = {
+  chatId: number;
+  userId: number;
+  title: string;
+  project: string | null;
+  schedule: MeetingSchedule;
+  stage: "time" | "custom-time" | "days";
+};
+
+type MeetingScheduleTimers = {
+  reminder: ReturnType<typeof setTimeout>;
+  start: ReturnType<typeof setTimeout>;
 };
 
 type DailySummaryMessage = {
