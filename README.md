@@ -59,7 +59,7 @@ MEETING_URL=https://meet.google.com/abc-defg-hij
 
 Бот принимает GitHub Organization Webhook по адресу `/webhooks/github` и отправляет в `GITHUB_COMMIT_CHAT_IDS` сообщение о каждом коммите из события `push`: проект, автора, ссылку и короткое понятное описание изменений.
 
-В Railway задайте `GITHUB_WEBHOOK_SECRET` (случайный секрет), `GITHUB_COMMIT_CHAT_IDS` (id Telegram-группы) и `GEMINI_API_KEY`. Необязательная `GEMINI_MODEL` задаёт модель Gemini, по умолчанию используется `gemini-2.5-flash`. Если Gemini временно недоступен, бот всё равно пришлёт уведомление с исходным сообщением коммита. Затем в настройках организации GitHub создайте Webhook с URL `https://<railway-domain>/webhooks/github`, тем же секретом, форматом `application/json` и единственным событием `Pushes`.
+В Railway задайте `GITHUB_WEBHOOK_SECRET` (случайный секрет), `GITHUB_COMMIT_CHAT_IDS` (id Telegram-группы), `GEMINI_API_KEY` и `GITHUB_API_TOKEN`. Последний должен быть fine-grained token с доступом к нужной организации и разрешением **Contents: Read-only** — по нему бот читает diff конкретного коммита, в том числе в приватных репозиториях. Для анализа коммитов по умолчанию используется `gemini-2.5-pro` (`GEMINI_COMMIT_MODEL`); групповые и meeting-сводки продолжают использовать `GEMINI_MODEL`, по умолчанию `gemini-2.5-flash`. Если GitHub или Gemini временно недоступен, бот всё равно пришлёт уведомление с исходным сообщением коммита. Затем в настройках организации GitHub создайте Webhook с URL `https://<railway-domain>/webhooks/github`, тем же секретом, форматом `application/json` и единственным событием `Pushes`.
 
 ## Дальше
 
