@@ -22,7 +22,7 @@ npm run dev
 - `MEETING_SUMMARY_CHAT_IDS` — id групп Telegram через запятую, куда отправлять итоги созвонов.
 - `DAILY_SUMMARY_CHAT_IDS` — id групп Telegram через запятую, куда отправлять ежедневные сводки переписки. Если не задан, используется `MEETING_SUMMARY_CHAT_IDS`.
 - `DAILY_SUMMARY_HOUR_MOSCOW` — час ежедневной сводки по Москве, по умолчанию `19`.
-- `DAILY_SUMMARY_SUBSCRIPTIONS_FILE`, `DAILY_SUMMARY_FILE` — постоянные файлы подписок и сообщений для ежедневных сводок. На Railway используйте `/data/...` в подключённом Volume.
+- `DAILY_SUMMARY_SUBSCRIPTIONS_FILE`, `DAILY_SUMMARY_FILE` — постоянные файлы подписок и сообщений для ежедневных сводок. Если не заданы, бот использует ту же папку, что и `MEETING_SUBSCRIPTIONS_FILE`; на Railway это должен быть `/data/...` в подключённом Volume.
 - `MEETING_URL` — запасная ссылка Google Meet, если доступ Google временно недоступен.
 - `MEETING_MESSAGE` — текст перед ссылкой, необязательно.
 - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN` — OAuth-данные Google с разрешением `https://www.googleapis.com/auth/meetings.space.created`.
