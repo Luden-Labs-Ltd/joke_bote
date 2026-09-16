@@ -534,7 +534,7 @@ async function summarizeGitHubCommit(payload: GitHubPushPayload, commit: GitHubC
       throw new Error("Commit summary is not in Russian");
     }
 
-    return summary.slice(0, 320);
+    return limitGitHubCommitSummary(summary);
   } catch (error) {
     console.error("GitHub commit summary failed; using generic Russian fallback", { commitId: commit.id, error });
     return "Внесены изменения в проект. Подробности доступны по ссылке на коммит.";
@@ -557,8 +557,24 @@ const githubCommitSummaryInstructions = [
   "Коротко объясни, что именно изменилось для продукта или разработчиков: сначала область, затем результат.",
   "Если есть несколько несвязанных изменений — перечисли их через точку с запятой.",
   "Не пересказывай название коммита, не выдумывай цель и не пиши общие фразы вроде 'обновлён код'.",
-  "Верни только 1–2 ясных предложения до 320 символов, без Markdown и заголовков.",
+  "Верни только 1–2 ясных предложения до 280 символов, без Markdown и заголовков.",
 ].join(" ");
+
+function limitGitHubCommitSummary(summary: string, maxCharacters = 320): string {
+  const normalized = summary.replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxCharacters) {
+    return normalized;
+  }
+
+  const withinLimit = normalized.slice(0, maxCharacters + 1);
+  const sentenceEnd = [...withinLimit.matchAll(/[.!?…](?=\s|$)/g)].at(-1)?.index;
+  if (sentenceEnd !== undefined && sentenceEnd >= Math.floor(maxCharacters / 2)) {
+    return withinLimit.slice(0, sentenceEnd + 1);
+  }
+
+  const wordEnd = withinLimit.lastIndexOf(" ");
+  return `${withinLimit.slice(0, wordEnd > 0 ? wordEnd : maxCharacters).trimEnd()}…`;
+}
 
 async function summarizeGitHubCommitWithOpenAI(
   payload: GitHubPushPayload,
