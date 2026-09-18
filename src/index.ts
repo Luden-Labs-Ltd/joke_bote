@@ -33,8 +33,6 @@ const dailySummaryChatIds = parseChatIds(process.env.DAILY_SUMMARY_CHAT_IDS ?? p
 const githubWebhookSecret = process.env.GITHUB_WEBHOOK_SECRET?.trim();
 const githubCommitChatIds = parseChatIds(process.env.GITHUB_COMMIT_CHAT_IDS);
 const githubApiToken = process.env.GITHUB_API_TOKEN?.trim();
-const openaiApiKey = process.env.OPENAI_API_KEY?.trim();
-const openaiCommitModel = process.env.OPENAI_COMMIT_MODEL?.trim() || "gpt-5-mini";
 const geminiApiKey = process.env.GEMINI_API_KEY?.trim();
 const geminiModel = process.env.GEMINI_MODEL?.trim() || "gemini-2.5-flash";
 const githubCommitModel = process.env.GEMINI_COMMIT_MODEL?.trim() || "gemini-2.5-pro";
@@ -84,9 +82,8 @@ console.log("Manager bot config loaded", {
   hasGoogleMeetAccess: hasGoogleMeetAccess(),
   githubCommitChatIdsCount: githubCommitChatIds.size,
   hasGitHubWebhookSecret: Boolean(githubWebhookSecret),
-  hasGitHubCommitSummaries: hasGeminiAccess() || Boolean(openaiApiKey),
-  githubCommitProvider: openaiApiKey ? "openai" : hasGeminiAccess() ? "gemini" : "none",
-  openaiCommitModel: openaiApiKey ? openaiCommitModel : null,
+  hasGitHubCommitSummaries: hasGeminiAccess(),
+  githubCommitProvider: hasGeminiAccess() ? "gemini" : "none",
   githubCommitModel,
   hasGitHubApiToken: Boolean(githubApiToken),
   schedule: "Monday through Thursday, 10:30 Europe/Moscow",
@@ -520,15 +517,13 @@ function formatGitHubCommitMessage(payload: GitHubPushPayload, commit: GitHubCom
 }
 
 async function summarizeGitHubCommit(payload: GitHubPushPayload, commit: GitHubCommit): Promise<string> {
-  if (!hasGeminiAccess() && !openaiApiKey) {
+  if (!hasGeminiAccess()) {
     return "Внесены изменения в проект. Подробности доступны по ссылке на коммит.";
   }
 
   try {
     const changeDetails = await getGitHubCommitDetails(payload.repository.full_name, commit.id);
-    const summary = openaiApiKey
-      ? await summarizeGitHubCommitWithOpenAI(payload, commit, changeDetails)
-      : await summarizeGitHubCommitWithGemini(payload, commit, changeDetails);
+    const summary = await summarizeGitHubCommitWithGemini(payload, commit, changeDetails);
 
     if (!/[А-Яа-яЁё]/.test(summary)) {
       throw new Error("Commit summary is not in Russian");
@@ -553,7 +548,8 @@ function buildGitHubCommitSummaryInput(payload: GitHubPushPayload, commit: GitHu
 
 const githubCommitSummaryInstructions = [
   "Ты пишешь понятное обновление для команды о конкретном коммите.",
-  "Пиши только по-русски, даже если исходные данные написаны на английском.",
+  "СТРОГО пиши только по-русски, даже если исходные данные написаны на английском. Молча переводи их смысл на русский.",
+  "Английские слова допустимы только в названиях файлов, классов, функций и других технических идентификаторах; английских предложений быть не должно.",
   "Коротко объясни, что именно изменилось для продукта или разработчиков: сначала область, затем результат.",
   "Если есть несколько несвязанных изменений — перечисли их через точку с запятой.",
   "Не пересказывай название коммита, не выдумывай цель и не пиши общие фразы вроде 'обновлён код'.",
@@ -576,36 +572,6 @@ function limitGitHubCommitSummary(summary: string, maxCharacters = 320): string 
   return `${withinLimit.slice(0, wordEnd > 0 ? wordEnd : maxCharacters).trimEnd()}…`;
 }
 
-async function summarizeGitHubCommitWithOpenAI(
-  payload: GitHubPushPayload,
-  commit: GitHubCommit,
-  changeDetails: GitHubCommitDetails,
-): Promise<string> {
-  const response = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${openaiApiKey!}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: openaiCommitModel,
-      instructions: githubCommitSummaryInstructions,
-      input: buildGitHubCommitSummaryInput(payload, commit, changeDetails),
-      max_output_tokens: 180,
-    }),
-  });
-
-  if (!response.ok) {
-    throw new Error(`OpenAI returned HTTP ${response.status}`);
-  }
-
-  const summary = extractOpenAIText((await response.json()) as OpenAIResponse);
-  if (!summary) {
-    throw new Error("OpenAI did not return a summary");
-  }
-  return summary;
-}
-
 async function summarizeGitHubCommitWithGemini(
   payload: GitHubPushPayload,
   commit: GitHubCommit,
@@ -617,7 +583,8 @@ async function summarizeGitHubCommitWithGemini(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        contents: [{ parts: [{ text: `${githubCommitSummaryInstructions}\n\n${buildGitHubCommitSummaryInput(payload, commit, changeDetails)}` }] }],
+        systemInstruction: { parts: [{ text: githubCommitSummaryInstructions }] },
+        contents: [{ parts: [{ text: buildGitHubCommitSummaryInput(payload, commit, changeDetails) }] }],
         generationConfig: { temperature: 0.1, maxOutputTokens: 180 },
       }),
     },
@@ -694,15 +661,6 @@ function formatChangedFiles(commit: GitHubCommit): string {
 function extractGeminiText(body: GeminiGenerateContentResponse): string | undefined {
   const text = body.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join(" ").replace(/\s+/g, " ").trim();
   return text || undefined;
-}
-
-function extractOpenAIText(body: OpenAIResponse): string | undefined {
-  const text = body.output_text ?? body.output
-    ?.flatMap((item) => item.content ?? [])
-    .filter((part) => part.type === "output_text")
-    .map((part) => part.text ?? "")
-    .join(" ");
-  return text?.replace(/\s+/g, " ").trim() || undefined;
 }
 
 function extractGeminiMultilineText(body: GeminiGenerateContentResponse): string | undefined {
@@ -1855,16 +1813,6 @@ type GeminiGenerateContentResponse = {
     content?: {
       parts?: Array<{ text?: string }>;
     };
-  }>;
-};
-
-type OpenAIResponse = {
-  output_text?: string;
-  output?: Array<{
-    content?: Array<{
-      type?: string;
-      text?: string;
-    }>;
   }>;
 };
 
