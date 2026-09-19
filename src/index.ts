@@ -611,7 +611,10 @@ async function summarizeGitHubCommitWithGemini(
         contents: [{ parts: [{ text: `${githubCommitSummaryInstructions}\n${retryInstruction}\n\n${buildGitHubCommitSummaryInput(payload, commit, changeDetails)}` }] }],
         generationConfig: {
           temperature: 0.1,
-          maxOutputTokens: 160,
+          // A commit digest does not need chain-of-thought. Without this, Flash can spend
+          // the entire response budget on thinking and return only the beginning of a sentence.
+          thinkingConfig: { thinkingBudget: 0 },
+          maxOutputTokens: 256,
           responseMimeType: "application/json",
           responseSchema: {
             type: "OBJECT",
