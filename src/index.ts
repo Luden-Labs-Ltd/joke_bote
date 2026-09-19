@@ -35,7 +35,7 @@ const githubCommitChatIds = parseChatIds(process.env.GITHUB_COMMIT_CHAT_IDS);
 const githubApiToken = process.env.GITHUB_API_TOKEN?.trim();
 const geminiApiKey = process.env.GEMINI_API_KEY?.trim();
 const geminiModel = process.env.GEMINI_MODEL?.trim() || "gemini-2.5-flash";
-const githubCommitModel = process.env.GEMINI_COMMIT_MODEL?.trim() || "gemini-2.5-pro";
+const githubCommitModel = process.env.GEMINI_COMMIT_MODEL?.trim() || "gemini-2.5-flash";
 const port = Number(process.env.WEBHOOK_PORT) || 3000;
 const meetingMessage = process.env.MEETING_MESSAGE?.trim() || "Your Google Meet link:";
 const defaultMeetingSchedule: MeetingSchedule = { time: "10:30", days: [1, 2, 3, 4] };
@@ -531,7 +531,10 @@ async function summarizeGitHubCommit(payload: GitHubPushPayload, commit: GitHubC
 
     return limitGitHubCommitSummary(summary);
   } catch (error) {
-    console.error("GitHub commit summary failed; using generic Russian fallback", { commitId: commit.id, error });
+    console.error("GitHub commit summary failed; using generic Russian fallback", {
+      commitId: commit.id,
+      error: getErrorMessage(error),
+    });
     return "Внесены изменения в проект. Подробности доступны по ссылке на коммит.";
   }
 }
@@ -583,15 +586,15 @@ async function summarizeGitHubCommitWithGemini(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        systemInstruction: { parts: [{ text: githubCommitSummaryInstructions }] },
-        contents: [{ parts: [{ text: buildGitHubCommitSummaryInput(payload, commit, changeDetails) }] }],
+        contents: [{ parts: [{ text: `${githubCommitSummaryInstructions}\n\n${buildGitHubCommitSummaryInput(payload, commit, changeDetails)}` }] }],
         generationConfig: { temperature: 0.1, maxOutputTokens: 180 },
       }),
     },
   );
 
   if (!response.ok) {
-    throw new Error(`Gemini returned HTTP ${response.status}`);
+    const errorBody = (await response.text()).replace(/\s+/g, " ").trim();
+    throw new Error(`Gemini returned HTTP ${response.status}: ${errorBody.slice(0, 600)}`);
   }
 
   const summary = extractGeminiText((await response.json()) as GeminiGenerateContentResponse);
@@ -599,6 +602,10 @@ async function summarizeGitHubCommitWithGemini(
     throw new Error("Gemini did not return a summary");
   }
   return summary;
+}
+
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 async function getGitHubCommitDetails(repository: string, commitId: string): Promise<GitHubCommitDetails> {
