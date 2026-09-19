@@ -523,13 +523,20 @@ async function summarizeGitHubCommit(payload: GitHubPushPayload, commit: GitHubC
 
   try {
     const changeDetails = await getGitHubCommitDetails(payload.repository.full_name, commit.id);
-    const summary = await summarizeGitHubCommitWithGemini(payload, commit, changeDetails);
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      const summary = await summarizeGitHubCommitWithGemini(payload, commit, changeDetails, attempt);
+      if (isCompleteRussianCommitSummary(summary)) {
+        return limitGitHubCommitSummary(summary);
+      }
 
-    if (!/[А-Яа-яЁё]/.test(summary)) {
-      throw new Error("Commit summary is not in Russian");
+      console.warn("GitHub commit summary was incomplete; retrying", {
+        commitId: commit.id,
+        attempt,
+        summary,
+      });
     }
 
-    return limitGitHubCommitSummary(summary);
+    throw new Error("Gemini returned an incomplete or non-Russian commit summary");
   } catch (error) {
     console.error("GitHub commit summary failed; using generic Russian fallback", {
       commitId: commit.id,
@@ -556,38 +563,64 @@ const githubCommitSummaryInstructions = [
   "Коротко объясни, что именно изменилось для продукта или разработчиков: сначала область, затем результат.",
   "Если есть несколько несвязанных изменений — перечисли их через точку с запятой.",
   "Не пересказывай название коммита, не выдумывай цель и не пиши общие фразы вроде 'обновлён код'.",
-  "Верни только 1–2 ясных предложения до 280 символов, без Markdown и заголовков.",
+  "Верни только 1–2 ясных законченных предложения до 280 символов, без Markdown и заголовков. Последний символ — точка, вопросительный или восклицательный знак.",
 ].join(" ");
 
 function limitGitHubCommitSummary(summary: string, maxCharacters = 320): string {
   const normalized = summary.replace(/\s+/g, " ").trim();
-  if (normalized.length <= maxCharacters) {
+  if (normalized.length <= maxCharacters && /[.!?…]$/.test(normalized)) {
     return normalized;
   }
 
-  const withinLimit = normalized.slice(0, maxCharacters + 1);
-  const sentenceEnd = [...withinLimit.matchAll(/[.!?…](?=\s|$)/g)].at(-1)?.index;
-  if (sentenceEnd !== undefined && sentenceEnd >= Math.floor(maxCharacters / 2)) {
-    return withinLimit.slice(0, sentenceEnd + 1);
+  const completeSentences = normalized.match(/[^.!?…]+[.!?…]+/g) ?? [];
+  const withinLimit = completeSentences
+    .map((sentence) => sentence.trim())
+    .reduce<string[]>((result, sentence) => {
+      const candidate = [...result, sentence].join(" ");
+      return candidate.length <= maxCharacters ? [...result, sentence] : result;
+    }, [])
+    .join(" ");
+
+  if (withinLimit) {
+    return withinLimit;
   }
 
-  const wordEnd = withinLimit.lastIndexOf(" ");
-  return `${withinLimit.slice(0, wordEnd > 0 ? wordEnd : maxCharacters).trimEnd()}…`;
+  throw new Error("Commit summary does not contain a complete sentence within the limit");
+}
+
+function isCompleteRussianCommitSummary(summary: string): boolean {
+  const normalized = summary.replace(/\s+/g, " ").trim();
+  return /[А-Яа-яЁё]/.test(normalized) && /[.!?…]$/.test(normalized) && normalized.length <= 320;
 }
 
 async function summarizeGitHubCommitWithGemini(
   payload: GitHubPushPayload,
   commit: GitHubCommit,
   changeDetails: GitHubCommitDetails,
+  attempt: number,
 ): Promise<string> {
+  const retryInstruction = attempt > 1
+    ? "Предыдущий ответ был оборван. Сформулируй итог заново и обязательно закончи предложение знаком препинания."
+    : "";
   const response = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(githubCommitModel)}:generateContent?key=${encodeURIComponent(geminiApiKey!)}`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        contents: [{ parts: [{ text: `${githubCommitSummaryInstructions}\n\n${buildGitHubCommitSummaryInput(payload, commit, changeDetails)}` }] }],
-        generationConfig: { temperature: 0.1, maxOutputTokens: 180 },
+        contents: [{ parts: [{ text: `${githubCommitSummaryInstructions}\n${retryInstruction}\n\n${buildGitHubCommitSummaryInput(payload, commit, changeDetails)}` }] }],
+        generationConfig: {
+          temperature: 0.1,
+          maxOutputTokens: 160,
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: "OBJECT",
+            properties: {
+              summary: { type: "STRING", description: "Краткое законченное описание коммита на русском языке." },
+            },
+            required: ["summary"],
+          },
+        },
       }),
     },
   );
@@ -597,11 +630,25 @@ async function summarizeGitHubCommitWithGemini(
     throw new Error(`Gemini returned HTTP ${response.status}: ${errorBody.slice(0, 600)}`);
   }
 
-  const summary = extractGeminiText((await response.json()) as GeminiGenerateContentResponse);
+  const summary = extractGitHubCommitSummary((await response.json()) as GeminiGenerateContentResponse);
   if (!summary) {
     throw new Error("Gemini did not return a summary");
   }
   return summary;
+}
+
+function extractGitHubCommitSummary(body: GeminiGenerateContentResponse): string | undefined {
+  const text = body.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join("").trim();
+  if (!text) {
+    return undefined;
+  }
+
+  try {
+    const parsed = JSON.parse(text) as { summary?: unknown };
+    return typeof parsed.summary === "string" ? parsed.summary.replace(/\s+/g, " ").trim() || undefined : undefined;
+  } catch {
+    throw new Error("Gemini returned invalid JSON for commit summary");
+  }
 }
 
 function getErrorMessage(error: unknown): string {
