@@ -507,32 +507,39 @@ async function announceGitHubPush(payload: GitHubPushPayload): Promise<void> {
   });
 }
 
-function formatGitHubCommitMessage(payload: GitHubPushPayload, commit: GitHubCommit, summary: string): string {
+function formatGitHubCommitMessage(payload: GitHubPushPayload, commit: GitHubCommit, analysis: GitHubCommitAnalysis): string {
   const project = escapeHtml(payload.repository.full_name);
   const author = escapeHtml(commit.author.username || commit.author.name || payload.sender.login);
-  const message = escapeHtml(summary);
   const commitUrl = `${payload.repository.html_url}/commit/${commit.id}`;
+  const steps = analysis.steps.map((step, index) => `${index + 1}. ${escapeHtml(step)}`);
 
-  return [`Проект: ${project}`, `Автор: ${author}`, `Коммит: <a href="${commitUrl}">${commit.id}</a>`, `Суть: ${message}`].join("\n");
+  return [
+    `Проект: ${project}`,
+    `Автор: ${author}`,
+    `Коммит: <a href="${commitUrl}">${commit.id}</a>`,
+    `Суть: ${escapeHtml(analysis.summary)}`,
+    ...(steps.length > 0 ? ["Этапы:", ...steps] : []),
+    ...(analysis.result ? [`Итог: ${escapeHtml(analysis.result)}`] : []),
+  ].join("\n");
 }
 
-async function summarizeGitHubCommit(payload: GitHubPushPayload, commit: GitHubCommit): Promise<string> {
+async function summarizeGitHubCommit(payload: GitHubPushPayload, commit: GitHubCommit): Promise<GitHubCommitAnalysis> {
   if (!hasGeminiAccess()) {
-    return "Внесены изменения в проект. Подробности доступны по ссылке на коммит.";
+    return { summary: "Внесены изменения в проект. Подробности доступны по ссылке на коммит.", steps: [] };
   }
 
   try {
     const changeDetails = await getGitHubCommitDetails(payload.repository.full_name, commit.id);
     for (let attempt = 1; attempt <= 2; attempt += 1) {
-      const summary = await summarizeGitHubCommitWithGemini(payload, commit, changeDetails, attempt);
-      if (isCompleteRussianCommitSummary(summary)) {
-        return limitGitHubCommitSummary(summary);
+      const analysis = await summarizeGitHubCommitWithGemini(payload, commit, changeDetails, attempt);
+      if (isCompleteRussianCommitAnalysis(analysis)) {
+        return limitGitHubCommitAnalysis(analysis);
       }
 
       console.warn("GitHub commit summary was incomplete; retrying", {
         commitId: commit.id,
         attempt,
-        summary,
+        analysis,
       });
     }
 
@@ -542,7 +549,7 @@ async function summarizeGitHubCommit(payload: GitHubPushPayload, commit: GitHubC
       commitId: commit.id,
       error: getErrorMessage(error),
     });
-    return "Внесены изменения в проект. Подробности доступны по ссылке на коммит.";
+    return { summary: "Внесены изменения в проект. Подробности доступны по ссылке на коммит.", steps: [] };
   }
 }
 
@@ -560,10 +567,10 @@ const githubCommitSummaryInstructions = [
   "Ты пишешь понятное обновление для команды о конкретном коммите.",
   "СТРОГО пиши только по-русски, даже если исходные данные написаны на английском. Молча переводи их смысл на русский.",
   "Английские слова допустимы только в названиях файлов, классов, функций и других технических идентификаторах; английских предложений быть не должно.",
-  "Коротко объясни, что именно изменилось для продукта или разработчиков: сначала область, затем результат.",
-  "Если есть несколько несвязанных изменений — перечисли их через точку с запятой.",
+  "Покажи изменения по этапам: каждый этап — отдельное конкретное действие из diff, в логичном порядке.",
+  "Объясни, что именно изменилось для продукта или разработчиков и к какому результату это приводит.",
   "Не пересказывай название коммита, не выдумывай цель и не пиши общие фразы вроде 'обновлён код'.",
-  "Верни только 1–2 ясных законченных предложения до 280 символов, без Markdown и заголовков. Последний символ — точка, вопросительный или восклицательный знак.",
+  "Каждая строка должна быть законченной мыслью и оканчиваться точкой, вопросительным или восклицательным знаком.",
 ].join(" ");
 
 function limitGitHubCommitSummary(summary: string, maxCharacters = 320): string {
@@ -588,9 +595,25 @@ function limitGitHubCommitSummary(summary: string, maxCharacters = 320): string 
   throw new Error("Commit summary does not contain a complete sentence within the limit");
 }
 
-function isCompleteRussianCommitSummary(summary: string): boolean {
+function isCompleteRussianCommitSummary(summary: string, maxCharacters = 320): boolean {
   const normalized = summary.replace(/\s+/g, " ").trim();
-  return /[А-Яа-яЁё]/.test(normalized) && /[.!?…]$/.test(normalized) && normalized.length <= 320;
+  return /[А-Яа-яЁё]/.test(normalized) && /[.!?…]$/.test(normalized) && normalized.length <= maxCharacters;
+}
+
+function limitGitHubCommitAnalysis(analysis: GitHubCommitAnalysis): GitHubCommitAnalysis {
+  return {
+    summary: limitGitHubCommitSummary(analysis.summary),
+    steps: analysis.steps.slice(0, 4).map((step) => limitGitHubCommitSummary(step, 280)),
+    result: analysis.result ? limitGitHubCommitSummary(analysis.result, 280) : undefined,
+  };
+}
+
+function isCompleteRussianCommitAnalysis(analysis: GitHubCommitAnalysis): boolean {
+  return isCompleteRussianCommitSummary(analysis.summary)
+    && analysis.steps.length > 0
+    && analysis.steps.length <= 4
+    && analysis.steps.every((step) => isCompleteRussianCommitSummary(step, 280))
+    && (!analysis.result || isCompleteRussianCommitSummary(analysis.result, 280));
 }
 
 async function summarizeGitHubCommitWithGemini(
@@ -598,7 +621,7 @@ async function summarizeGitHubCommitWithGemini(
   commit: GitHubCommit,
   changeDetails: GitHubCommitDetails,
   attempt: number,
-): Promise<string> {
+): Promise<GitHubCommitAnalysis> {
   const retryInstruction = attempt > 1
     ? "Предыдущий ответ был оборван. Сформулируй итог заново и обязательно закончи предложение знаком препинания."
     : "";
@@ -614,14 +637,16 @@ async function summarizeGitHubCommitWithGemini(
           // A commit digest does not need chain-of-thought. Without this, Flash can spend
           // the entire response budget on thinking and return only the beginning of a sentence.
           thinkingConfig: { thinkingBudget: 0 },
-          maxOutputTokens: 256,
+          maxOutputTokens: 512,
           responseMimeType: "application/json",
           responseSchema: {
             type: "OBJECT",
             properties: {
               summary: { type: "STRING", description: "Краткое законченное описание коммита на русском языке." },
+              steps: { type: "ARRAY", items: { type: "STRING" }, description: "От одного до четырёх последовательных конкретных изменений из коммита." },
+              result: { type: "STRING", description: "Краткий итог изменений для продукта или разработчиков на русском языке." },
             },
-            required: ["summary"],
+            required: ["summary", "steps", "result"],
           },
         },
       }),
@@ -633,22 +658,32 @@ async function summarizeGitHubCommitWithGemini(
     throw new Error(`Gemini returned HTTP ${response.status}: ${errorBody.slice(0, 600)}`);
   }
 
-  const summary = extractGitHubCommitSummary((await response.json()) as GeminiGenerateContentResponse);
-  if (!summary) {
-    throw new Error("Gemini did not return a summary");
+  const analysis = extractGitHubCommitAnalysis((await response.json()) as GeminiGenerateContentResponse);
+  if (!analysis) {
+    throw new Error("Gemini did not return a commit analysis");
   }
-  return summary;
+  return analysis;
 }
 
-function extractGitHubCommitSummary(body: GeminiGenerateContentResponse): string | undefined {
+function extractGitHubCommitAnalysis(body: GeminiGenerateContentResponse): GitHubCommitAnalysis | undefined {
   const text = body.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join("").trim();
   if (!text) {
     return undefined;
   }
 
   try {
-    const parsed = JSON.parse(text) as { summary?: unknown };
-    return typeof parsed.summary === "string" ? parsed.summary.replace(/\s+/g, " ").trim() || undefined : undefined;
+    const parsed = JSON.parse(text) as { summary?: unknown; steps?: unknown; result?: unknown };
+    if (typeof parsed.summary !== "string" || !Array.isArray(parsed.steps) || typeof parsed.result !== "string") {
+      return undefined;
+    }
+
+    const steps = parsed.steps
+      .filter((step): step is string => typeof step === "string")
+      .map((step) => step.replace(/\s+/g, " ").trim())
+      .filter(Boolean);
+    const summary = parsed.summary.replace(/\s+/g, " ").trim();
+    const result = parsed.result.replace(/\s+/g, " ").trim();
+    return summary && result ? { summary, steps, result } : undefined;
   } catch {
     throw new Error("Gemini returned invalid JSON for commit summary");
   }
@@ -1863,6 +1898,12 @@ type GitHubCommitFile = {
   filename: string;
   status?: string;
   patch?: string;
+};
+
+type GitHubCommitAnalysis = {
+  summary: string;
+  steps: string[];
+  result?: string;
 };
 
 type GeminiGenerateContentResponse = {
