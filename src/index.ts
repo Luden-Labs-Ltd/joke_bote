@@ -567,7 +567,8 @@ const githubCommitSummaryInstructions = [
   "Ты пишешь понятное обновление для команды о конкретном коммите.",
   "СТРОГО пиши только по-русски, даже если исходные данные написаны на английском. Молча переводи их смысл на русский.",
   "Английские слова допустимы только в названиях файлов, классов, функций и других технических идентификаторах; английских предложений быть не должно.",
-  "Покажи изменения по этапам: каждый этап — отдельное конкретное действие из diff, в логичном порядке.",
+  "Покажи только главные изменения по этапам: от одного до четырёх пунктов, каждый этап — отдельное конкретное действие из diff, в логичном порядке.",
+  "Не перечисляй все файлы, тесты и мелкие правки. Объединяй однотипные изменения в один этап; если коммит большой, выбери только наиболее важные.",
   "Объясни, что именно изменилось для продукта или разработчиков и к какому результату это приводит.",
   "Не пересказывай название коммита, не выдумывай цель и не пиши общие фразы вроде 'обновлён код'.",
   "Каждая строка должна быть законченной мыслью и оканчиваться точкой, вопросительным или восклицательным знаком.",
@@ -610,7 +611,6 @@ function limitGitHubCommitAnalysis(analysis: GitHubCommitAnalysis): GitHubCommit
 
 function isCompleteRussianCommitAnalysis(analysis: GitHubCommitAnalysis): boolean {
   return isCompleteRussianCommitSummary(analysis.summary)
-    && analysis.steps.length > 0
     && analysis.steps.length <= 4
     && analysis.steps.every((step) => isCompleteRussianCommitSummary(step, 280))
     && (!analysis.result || isCompleteRussianCommitSummary(analysis.result, 280));
@@ -623,7 +623,7 @@ async function summarizeGitHubCommitWithGemini(
   attempt: number,
 ): Promise<GitHubCommitAnalysis> {
   const retryInstruction = attempt > 1
-    ? "Предыдущий ответ был оборван. Сформулируй итог заново и обязательно закончи предложение знаком препинания."
+    ? "Предыдущий ответ был оборван. Верни только 2–3 самых важных этапа, не перечисляй мелкие правки и обязательно закончи каждое предложение знаком препинания."
     : "";
   const response = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(githubCommitModel)}:generateContent?key=${encodeURIComponent(geminiApiKey!)}`,
@@ -637,16 +637,25 @@ async function summarizeGitHubCommitWithGemini(
           // A commit digest does not need chain-of-thought. Without this, Flash can spend
           // the entire response budget on thinking and return only the beginning of a sentence.
           thinkingConfig: { thinkingBudget: 0 },
-          maxOutputTokens: 512,
+          // A hard schema limit prevents large commits from being truncated while the
+          // model tries to enumerate every changed file. The modest extra room also
+          // lets it close the JSON response reliably.
+          maxOutputTokens: 768,
           responseMimeType: "application/json",
           responseSchema: {
             type: "OBJECT",
             properties: {
               summary: { type: "STRING", description: "Краткое законченное описание коммита на русском языке." },
-              steps: { type: "ARRAY", items: { type: "STRING" }, description: "От одного до четырёх последовательных конкретных изменений из коммита." },
+              steps: {
+                type: "ARRAY",
+                items: { type: "STRING" },
+                minItems: 1,
+                maxItems: 4,
+                description: "От одного до четырёх последовательных главных изменений из коммита. Не перечисляй все файлы и мелкие правки.",
+              },
               result: { type: "STRING", description: "Краткий итог изменений для продукта или разработчиков на русском языке." },
             },
-            required: ["summary", "steps", "result"],
+            required: ["summary", "steps"],
           },
         },
       }),
@@ -673,7 +682,7 @@ function extractGitHubCommitAnalysis(body: GeminiGenerateContentResponse): GitHu
 
   try {
     const parsed = JSON.parse(text) as { summary?: unknown; steps?: unknown; result?: unknown };
-    if (typeof parsed.summary !== "string" || !Array.isArray(parsed.steps) || typeof parsed.result !== "string") {
+    if (typeof parsed.summary !== "string" || !Array.isArray(parsed.steps)) {
       return undefined;
     }
 
@@ -682,8 +691,8 @@ function extractGitHubCommitAnalysis(body: GeminiGenerateContentResponse): GitHu
       .map((step) => step.replace(/\s+/g, " ").trim())
       .filter(Boolean);
     const summary = parsed.summary.replace(/\s+/g, " ").trim();
-    const result = parsed.result.replace(/\s+/g, " ").trim();
-    return summary && result ? { summary, steps, result } : undefined;
+    const result = typeof parsed.result === "string" ? parsed.result.replace(/\s+/g, " ").trim() : undefined;
+    return summary ? { summary, steps, result } : undefined;
   } catch {
     throw new Error("Gemini returned invalid JSON for commit summary");
   }
