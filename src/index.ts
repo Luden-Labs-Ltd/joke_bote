@@ -430,7 +430,7 @@ process.once("SIGTERM", () => bot.stop("SIGTERM"));
 function startGitHubWebhookServer(): void {
   createServer(async (request, response) => {
     try {
-      if (await handleAdmin(request, response, commitStore, { email: adminEmail, passwordHash: adminPasswordHash, sessionSecret: adminSessionSecret, geminiApiKey, geminiModel: githubCommitModel })) return;
+      if (await handleAdmin(request, response, commitStore, { email: adminEmail, passwordHash: adminPasswordHash, sessionSecret: adminSessionSecret, geminiApiKey, geminiModel: githubCommitModel, githubApiToken })) return;
     } catch (error) {
       captureException(error, "admin.request");
       console.error("Admin request failed", error);
@@ -568,12 +568,12 @@ function formatGitHubCommitMessage(payload: GitHubPushPayload, commit: GitHubCom
 }
 
 async function summarizeGitHubCommit(payload: GitHubPushPayload, commit: GitHubCommit): Promise<GitHubCommitAnalysis> {
+  const changeDetails = await getGitHubCommitDetails(payload.repository.full_name, commit.id);
   if (!hasGeminiAccess()) {
     return { summary: "Внесены изменения в проект. Подробности доступны по ссылке на коммит.", steps: [] };
   }
 
   try {
-    const changeDetails = await getGitHubCommitDetails(payload.repository.full_name, commit.id);
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       const analysis = await summarizeGitHubCommitWithGemini(payload, commit, changeDetails, attempt);
       if (isCompleteRussianCommitAnalysis(analysis)) {
@@ -771,6 +771,9 @@ async function getGitHubCommitDetails(repository: string, commitId: string): Pro
     }
 
     const details = (await response.json()) as GitHubCommitDetails;
+    if (typeof details.stats?.additions === "number" && typeof details.stats.deletions === "number") {
+      commitStore.setCommitStats(repository, commitId, { additions: details.stats.additions, deletions: details.stats.deletions, changedFiles: details.files && details.files.length < 300 ? details.files.length : null });
+    }
     console.log("GitHub commit diff loaded", { repository, commitId, fileCount: details.files?.length ?? 0 });
     return details;
   } catch (error) {
@@ -1946,6 +1949,7 @@ type GitHubCommit = {
 };
 
 type GitHubCommitDetails = {
+  stats?: { additions: number; deletions: number; total: number };
   files?: GitHubCommitFile[];
 };
 

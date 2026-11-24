@@ -3,7 +3,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Author, CommitRow, CommitStore } from "./commit-store.js";
 import { generateAuthorInsight } from "./author-insight.js";
 
-type AdminConfig = { email: string; passwordHash: string; sessionSecret: string; geminiApiKey?: string; geminiModel?: string };
+type AdminConfig = { email: string; passwordHash: string; sessionSecret: string; geminiApiKey?: string; geminiModel?: string; githubApiToken?: string };
 const failedLogins = new Map<string, { attempts: number; until: number }>();
 
 export async function handleAdmin(request: IncomingMessage, response: ServerResponse, store: CommitStore, config: AdminConfig): Promise<boolean> {
@@ -120,6 +120,7 @@ export async function handleAdmin(request: IncomingMessage, response: ServerResp
     const id = Number(profile[1]);
     const author = combinedAuthors(store.authors()).find((person) => person.id === id);
     if (!author) { response.writeHead(404).end(); return true; }
+    if (config.githubApiToken) await loadRecentCommitStats(store, id, config.githubApiToken);
     const activity = store.authorActivity(id);
     const insight = store.authorInsight(id);
     const evidence = (insight?.evidence ?? []).map((sha) => store.authorCommitBySha(id, sha)).filter((commit) => commit !== undefined);
@@ -135,12 +136,12 @@ export async function handleAdmin(request: IncomingMessage, response: ServerResp
       ${loading ? '<p class="notice">История ещё загружается. Цифры могут увеличиться.</p>' : ""}
       <div class="cards profile-cards"><article><span>Коммитов за 30 дней</span><strong>${author.last_30}</strong></article><article><span>Активных дней</span><strong>${activity.activeDays}</strong></article><article><span>За 7 дней</span><strong>${recent7Total}</strong></article><article><span>Проектов за 30 дней</span><strong>${activity.repositoryCount}</strong></article></div>
       <section><div class="activity-heading"><div><h2>Коммиты по дням · последние 7 дней</h2><small>Даты и время — Минск</small></div><div class="last-commit"><span>Последний коммит</span><strong>${date(author.last_commit)}</strong></div></div>
-      <div class="activity-days">${recentDays.map((row) => `<div class="activity-day"><span>${escapeHtml(dayLabel(row.day))}</span><div class="activity-track" aria-hidden="true"><div class="activity-fill" style="width:${row.commits ? Math.max(3, row.commits / max * 100) : 0}%"></div></div><strong>${row.commits}</strong></div>`).join("")}</div></section>
+      <div class="activity-days">${recentDays.map((row) => `<${row.commits ? `a href="${escapeHtml(dayCommitsUrl(id, row.day))}"` : "div"} class="activity-day${row.commits ? " activity-day-link" : ""}"><span>${escapeHtml(dayLabel(row.day))}</span><div class="activity-track" aria-hidden="true"><div class="activity-fill" style="width:${row.commits ? Math.max(3, row.commits / max * 100) : 0}%"></div></div><strong>${row.commits}</strong></${row.commits ? "a" : "div"}>`).join("")}</div><details class="days-detail"><summary>Все активные дни за 30 дней (${activity.activeDays})</summary><div class="days-list">${[...activity.days].reverse().map((row) => `<a href="${escapeHtml(dayCommitsUrl(id, row.day))}"><span>${escapeHtml(dayLabel(row.day))}</span><strong>${row.commits} ${plural(row.commits, "коммит", "коммита", "коммитов")} →</strong></a>`).join("") || '<p class="muted">Коммитов за 30 дней нет.</p>'}</div></details></section>
       <div class="profile-columns"><section><h2>Проекты за 30 дней</h2>${activity.repositories.map((repo) => `<a class="stat-line project-row" href="${escapeHtml(`/admin/commits?author=${id}&repository=${encodeURIComponent(repo.repository)}`)}"><span>${escapeHtml(repo.repository)}</span><strong>${repo.commits} <span aria-hidden="true">→</span></strong></a>`).join("") || '<p class="muted">Пока нет коммитов.</p>'}</section>
       <section><h2>Итог по коммитам</h2><p class="muted">ИИ описывает темы работы по доступным коммитам. Это не оценка сотрудника.</p>${url.searchParams.has("insight_error") ? '<p class="error">Не удалось создать итог. Попробуйте позже; предыдущий итог сохранён.</p>' : ""}
       ${insight ? `<p>${escapeHtml(insight.summary)}</p><small>Составлено ${date(insight.generated_at)} · на момент итога: ${insight.commit_count} коммитов за 30 дней</small><div class="evidence">${evidence.map((commit) => `<a href="${escapeHtml(commit.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(commit.message.split("\n")[0].slice(0, 95))} ↗</a>`).join("")}</div>` : '<p class="muted">Итог ещё не составлен.</p>'}
       <form method="post" action="/admin/insight"><input type="hidden" name="csrf" value="${csrf}"><input type="hidden" name="id" value="${id}"><button data-loading-label="Составляю итог…" ${author.last_30 ? "" : "disabled"}>${insight ? "Обновить итог" : "Составить итог за 30 дней"}</button></form></section></div>
-      <section><div class="section-heading"><h2>Последние коммиты</h2><a href="/admin/commits?author=${id}">Вся история →</a></div>${activity.recent.slice(0, 10).map((commit) => `<div class="recent-commit"><a href="${escapeHtml(commit.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(commit.message.split("\n")[0])}</a><small>${escapeHtml(commit.repository)} · ${date(commit.committed_at)}</small></div>`).join("") || '<p class="muted">За последние 30 дней коммитов нет.</p>'}</section>`;
+      <section><div class="section-heading"><h2>Последние коммиты</h2><a href="/admin/commits?author=${id}">Вся история →</a></div><p class="muted commit-size-hint">Объём — изменённые строки и файлы. Он не показывает сложность или качество работы.</p>${activity.recent.slice(0, 10).map((commit) => `<div class="recent-commit"><a href="${escapeHtml(commit.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(commit.message.split("\n")[0])}</a><small>${escapeHtml(commit.repository)} · ${date(commit.committed_at)}</small>${commitDescription(commit)}${commitSize(commit, true)}</div>`).join("") || '<p class="muted">За последние 30 дней коммитов нет.</p>'}</section>`;
     sendHtml(response, page(author.name, content, true, csrf));
     return true;
   }
@@ -176,7 +177,7 @@ export async function handleAdmin(request: IncomingMessage, response: ServerResp
       <select name="repository" aria-label="Проект"><option value="">Все проекты</option>${repositories.map((name) => `<option value="${escapeHtml(name)}" ${name === repository ? "selected" : ""}>${escapeHtml(name)}</option>`).join("")}</select>
       <label>С <input type="date" name="from" value="${from ?? ""}"></label><label>По <input type="date" name="to" value="${to ?? ""}"></label><button>Показать</button></form>
       <p class="muted commit-hint">Под заголовком показывается описание, если оно есть в сообщении коммита или создано ботом.</p>
-      ${commits.map((commit) => `<article class="commit"><div><a href="${escapeHtml(commit.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(commit.message.split("\n")[0])}</a><p>${escapeHtml(commit.author_name)} · ${escapeHtml(commit.repository)} · ${date(commit.committed_at)} · ${escapeHtml(commit.sha.slice(0, 8))}</p>${commitDescription(commit)}</div></article>`).join("") || "Коммиты не найдены."}
+      ${commits.map((commit) => `<article class="commit"><div><a href="${escapeHtml(commit.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(commit.message.split("\n")[0])}</a><p>${escapeHtml(commit.author_name)} · ${escapeHtml(commit.repository)} · ${date(commit.committed_at)} · ${escapeHtml(commit.sha.slice(0, 8))}</p>${commitDescription(commit)}${commitSize(commit)}</div></article>`).join("") || "Коммиты не найдены."}
       <nav class="pagination">${currentPage > 1 ? `<a href="${pageUrl(url, currentPage - 1)}">← Назад</a>` : ""}<span>Страница ${currentPage}</span>${commits.length === 50 ? `<a href="${pageUrl(url, currentPage + 1)}">Вперёд →</a>` : ""}</nav>`;
     sendHtml(response, page("Коммиты", content, true, csrf));
     return true;
@@ -221,12 +222,43 @@ function commitDescription(commit: CommitRow): string {
   return "";
 }
 
+function commitSize(commit: CommitRow, showMissing = false): string {
+  if (commit.additions === null || commit.deletions === null) return showMissing ? '<small class="commit-size">Объём пока недоступен</small>' : "";
+  return `<small class="commit-size">${commit.changed_files === null ? "" : `${commit.changed_files} ${plural(commit.changed_files, "файл", "файла", "файлов")} · `}<span>+${commit.additions}</span> / <span>−${commit.deletions}</span> строк</small>`;
+}
+
+function dayCommitsUrl(id: number, day: string): string {
+  return `/admin/commits?author=${id}&from=${day}&to=${day}`;
+}
+
+async function loadRecentCommitStats(store: CommitStore, id: number, token: string): Promise<void> {
+  const missing = store.recentCommitsNeedingStats(id);
+  await Promise.all(missing.map(async ({ repository, sha }) => {
+    const [owner, repo] = repository.split("/", 2);
+    if (!owner || !repo) return;
+    try {
+      const response = await fetch(`https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/commits/${encodeURIComponent(sha)}`, {
+        headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${token}`, "User-Agent": "manager-bot", "X-GitHub-Api-Version": "2022-11-28" },
+        signal: AbortSignal.timeout(4000),
+      });
+      if (!response.ok) throw new Error(`GitHub HTTP ${response.status}`);
+      const data = await response.json() as { stats?: { additions?: number; deletions?: number }; files?: unknown[] };
+      const stats = data.stats;
+      store.setCommitStats(repository, sha, typeof stats?.additions === "number" && typeof stats.deletions === "number"
+        ? { additions: stats.additions, deletions: stats.deletions, changedFiles: data.files && data.files.length < 300 ? data.files.length : null } : null);
+    } catch (error) {
+      console.warn("Commit size is unavailable", { repository, sha, error });
+      store.setCommitStats(repository, sha, null);
+    }
+  }));
+}
+
 function loginPage(error: boolean): string {
   return page("Вход", `<div class="login"><h1>Вход в админку</h1>${error ? `<p class="error">Неверный email или пароль</p>` : ""}<form method="post" action="/admin/login"><label>Email<input name="email" type="email" autocomplete="username" required></label><label>Пароль<input name="password" type="password" autocomplete="current-password" required></label><button>Войти</button></form></div>`, false);
 }
 
 function page(title: string, content: string, authenticated: boolean, csrf = ""): string {
-  return `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)} · Manager Bot</title><style>${css}${mobileHeaderCss}${dashboardCss}${polishCss}${interactionCss}${responsiveFilterCss}${activityCss}</style></head><body>
+  return `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)} · Manager Bot</title><style>${css}${mobileHeaderCss}${dashboardCss}${polishCss}${interactionCss}${responsiveFilterCss}${activityCss}${profileDetailCss}</style></head><body>
     ${authenticated ? `<header><a class="brand" href="/admin">Manager Bot</a><nav><a href="/admin">Обзор</a><a href="/admin/people">Сотрудники</a><a href="/admin/commits">Коммиты</a><a href="/admin/import">Загрузка</a></nav><form method="post" action="/admin/logout"><input type="hidden" name="csrf" value="${csrf}"><button class="quiet" data-loading-label="Выходим…">Выйти</button></form></header>` : ""}
     <main>${content}</main><script>${interactionJs}</script></body></html>`;
 }
@@ -238,6 +270,7 @@ const polishCss = `.people-person{display:flex;flex-direction:column;gap:3px;min
 const interactionCss = `.project-row{color:inherit;cursor:pointer;align-items:center;border-radius:8px;padding:9px 10px;margin:0 -10px;transition:background-color .15s ease,color .15s ease}.project-row strong{white-space:nowrap}.project-row:hover{background:#eef3fd;color:#305cb8;text-decoration:none}.project-row:focus-visible,a:focus-visible,button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid #4678db;outline-offset:2px}.commit-description{white-space:pre-line;overflow-wrap:anywhere;margin-top:10px!important;line-height:1.5}.is-loading{display:inline-flex;align-items:center;justify-content:center;gap:8px;opacity:.8;cursor:progress!important}.is-loading:before{content:'';width:13px;height:13px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:spin .7s linear infinite;flex:none}@keyframes spin{to{transform:rotate(360deg)}}@media(prefers-reduced-motion:reduce){.is-loading:before{animation:none}}@media(prefers-color-scheme:dark){.project-row:hover{background:#263c58;color:#b8cbff}}`;
 const responsiveFilterCss = `.commit-hint{font-size:13px;margin:-6px 0 18px}@media(max-width:600px){.filters select{width:100%;min-width:0}.filters label{flex:1 1 130px;min-width:0}.filters label input{width:100%;min-width:0}.filters button{min-width:120px}}`;
 const activityCss = `.activity-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;margin-bottom:22px}.activity-heading h2{margin-bottom:4px}.last-commit{display:flex;flex-direction:column;gap:4px;text-align:right;white-space:nowrap}.last-commit span{font-size:12px;color:#647084}.last-commit strong{font-size:16px}.activity-days{display:grid;gap:12px}.activity-day{display:grid;grid-template-columns:140px minmax(0,1fr) 64px;align-items:center;gap:14px;font-size:14px}.activity-day strong{text-align:right;font-size:16px}.activity-track{height:13px;border-radius:7px;background:#e9eef6;overflow:hidden}.activity-fill{height:100%;border-radius:7px;background:#4678db}@media(max-width:600px){.activity-heading{flex-wrap:wrap;gap:14px}.last-commit{text-align:left}.activity-day{grid-template-columns:90px minmax(0,1fr) 35px;gap:8px;font-size:12px}.activity-day strong{font-size:14px}}@media(prefers-color-scheme:dark){.last-commit span{color:#a5b4c7}.activity-track{background:#344155}.activity-fill{background:#7ca6ff}.project-row,.project-row:visited{color:#edf2f8}}`;
+const profileDetailCss = `.activity-day-link{color:inherit;border-radius:7px;margin:-3px -7px;padding:3px 7px}.activity-day-link:hover,.days-list a:hover{background:#eef3fd;text-decoration:none}.activity-day-link strong:after{content:' →';color:#305cb8}.days-detail{margin-top:20px;border-top:1px solid #e0e6ef;padding-top:12px}.days-detail summary{cursor:pointer;color:#305cb8;font-weight:600}.days-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px 24px;margin-top:12px}.days-list a{display:flex;justify-content:space-between;gap:12px;padding:8px;color:inherit;border-radius:6px}.commit-size{display:block;margin-top:5px;font-size:12px}.commit-size span:first-child{color:#247851}.commit-size span:last-child{color:#ba4b4b}.commit-size-hint{font-size:13px;margin-top:-8px}@media(max-width:600px){.days-list{grid-template-columns:1fr}}@media(prefers-color-scheme:dark){.activity-day-link:hover,.days-list a:hover{background:#263c58}.activity-day-link strong:after,.days-detail summary{color:#92b5ff}.days-detail{border-color:#334155}.commit-size span:first-child{color:#7bd8a6}.commit-size span:last-child{color:#ff9a9a}}`;
 const interactionJs = `document.addEventListener('submit',function(event){const form=event.target;if(!(form instanceof HTMLFormElement))return;if(form.dataset.submitting==='1'){event.preventDefault();return}const button=event.submitter instanceof HTMLButtonElement?event.submitter:form.querySelector('button');if(!button)return;form.dataset.submitting='1';button.dataset.originalLabel=button.textContent||'';button.textContent=button.dataset.loadingLabel||(form.action.endsWith('/login')?'Входим…':form.method.toLowerCase()==='get'?'Показываю…':'Сохраняю…');button.classList.add('is-loading');button.setAttribute('aria-busy','true');button.disabled=true});document.addEventListener('change',function(event){const select=event.target;if(!(select instanceof HTMLSelectElement)||select.name!=='author'||!select.form||!select.form.action.endsWith('/commits'))return;const repository=select.form.elements.namedItem('repository');if(repository instanceof HTMLSelectElement)repository.value='';select.form.requestSubmit()});window.addEventListener('pageshow',function(){document.querySelectorAll('form[data-submitting="1"]').forEach(function(form){form.dataset.submitting='0';form.querySelectorAll('button.is-loading').forEach(function(button){button.textContent=button.dataset.originalLabel||button.textContent;button.disabled=false;button.classList.remove('is-loading');button.removeAttribute('aria-busy')})})});`;
 
 function getSession(request: IncomingMessage, secret: string): string | null {

@@ -112,6 +112,7 @@ test("dashboard ranks merged authors and profile counts active days and projects
     insert("c", "Bob", "bob", "org/other");
     insert("d", "Hidden Bot", "bot", "org/app");
     store.setSummary("org/api", "b".repeat(40), "Изменена авторизация проекта.");
+    store.setCommitStats("org/api", "b".repeat(40), { additions: 42, deletions: 7, changedFiles: 3 });
     const people = store.authors();
     const alice = people.find((person) => person.github_login === "alice");
     store.mergeAuthor(people.find((person) => person.github_login === "alice-work").id, alice.id);
@@ -120,6 +121,8 @@ test("dashboard ranks merged authors and profile counts active days and projects
     assert.equal(activity.activeDays, 1);
     assert.equal(activity.repositoryCount, 2);
     assert.equal(activity.recent.length, 3);
+    assert.equal(activity.recent.find((commit) => commit.sha === "b".repeat(40)).additions, 42);
+    assert.equal(store.recentCommitsNeedingStats(alice.id).length, 2);
     const cookie = `admin_session=${Date.now() + 100_000}.nonce`;
     const { createHmac } = await import("node:crypto");
     const signed = `${cookie}.${createHmac("sha256", config.sessionSecret).update(cookie.slice(14)).digest("hex")}`;
@@ -132,11 +135,16 @@ test("dashboard ranks merged authors and profile counts active days and projects
     const profile = await (await fetch(`${base}/admin/people/${alice.id}`, { headers: { Cookie: signed } })).text();
     assert.match(profile, /Активных дней/);
     assert.match(profile, /org\/api/);
+    assert.match(profile, /Все активные дни за 30 дней/);
+    assert.match(profile, new RegExp(`/admin/commits\\?author=${alice.id}&amp;from=\\d{4}-\\d{2}-\\d{2}&amp;to=\\d{4}-\\d{2}-\\d{2}`));
+    assert.match(profile, /3 файла · <span>\+42<\/span> \/ <span>−7<\/span> строк/);
+    assert.match(profile, /Updated token validation/);
     assert.match(profile, new RegExp(`/admin/commits\\?author=${alice.id}&amp;repository=org%2Fapi`));
     const historyResponse = await fetch(`${base}/admin/commits?author=${alice.id}&repository=org%2Fapi`, { headers: { Cookie: signed } });
     const history = await historyResponse.text();
     assert.match(history, /Изменена авторизация проекта/);
     assert.match(history, /Updated token validation/);
+    assert.match(history, /\+42/);
     assert.match(history, /<option value="org\/api" selected>/);
     assert.match(history, /<option value="org\/app"/);
     assert.doesNotMatch(history, /<option value="org\/other"/);
@@ -161,6 +169,41 @@ test("failed insight generation leaves the saved summary intact", async () => {
     assert.equal(store.authorInsight(id).summary, "Предыдущий итог");
   } finally {
     globalThis.fetch = originalFetch;
+    rmSync(folder, { recursive: true, force: true });
+  }
+});
+
+test("employee profile loads and caches size of historical commits", async () => {
+  const folder = mkdtempSync(join(tmpdir(), "manager-size-"));
+  const store = new CommitStore(join(folder, "commits.sqlite"));
+  const config = { email: "admin@example.com", passwordHash: "unused:unused", sessionSecret: randomBytes(32).toString("hex"), githubApiToken: "fake-token" };
+  const sha = "a".repeat(40);
+  store.upsertCommit({ repository: "org/app", sha, message: "Fix search\n\nHandle empty results", committedAt: new Date().toISOString(), authorName: "Alice", authorLogin: "alice", url: `https://github.com/org/app/commit/${sha}` });
+  const server = createServer((request, response) => { void handleAdmin(request, response, store, config); });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const originalFetch = globalThis.fetch;
+  let githubCalls = 0;
+  globalThis.fetch = async (input, options) => {
+    if (String(input).startsWith("https://api.github.com/")) {
+      githubCalls += 1;
+      assert.match(String(input), /org\/app\/commits\/a{40}/);
+      return new Response(JSON.stringify({ stats: { additions: 124, deletions: 9 }, files: [{}, {}] }), { status: 200 });
+    }
+    return originalFetch(input, options);
+  };
+  try {
+    const { createHmac } = await import("node:crypto");
+    const session = `${Date.now() + 100_000}.nonce`;
+    const cookie = `admin_session=${session}.${createHmac("sha256", config.sessionSecret).update(session).digest("hex")}`;
+    const url = `http://127.0.0.1:${server.address().port}/admin/people/${store.authors()[0].id}`;
+    const first = await (await fetch(url, { headers: { Cookie: cookie } })).text();
+    assert.match(first, /2 файла · <span>\+124<\/span> \/ <span>−9<\/span> строк/);
+    assert.match(first, /Handle empty results/);
+    await fetch(url, { headers: { Cookie: cookie } });
+    assert.equal(githubCalls, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await new Promise((resolve) => server.close(resolve));
     rmSync(folder, { recursive: true, force: true });
   }
 });

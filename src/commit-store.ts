@@ -15,7 +15,7 @@ export type CommitInput = {
 };
 
 export type Author = { id: number; name: string; github_login: string | null; hidden: number; merged_into: number | null; commits: number; last_commit: string | null; last_7: number; last_30: number };
-export type CommitRow = { repository: string; sha: string; message: string; committed_at: string; url: string; summary: string | null; author_id: number; author_name: string };
+export type CommitRow = { repository: string; sha: string; message: string; committed_at: string; url: string; summary: string | null; author_id: number; author_name: string; additions: number | null; deletions: number | null; changed_files: number | null };
 export type Repository = { full_name: string; status: string; error: string | null; updated_at: string | null; commit_count: number };
 export type AuthorActivity = { activeDays: number; repositoryCount: number; days: { day: string; commits: number }[]; repositories: { repository: string; commits: number }[]; recent: CommitRow[] };
 export type AuthorInsight = { summary: string; evidence: string[]; generated_at: string; commit_count: number };
@@ -58,6 +58,11 @@ export class CommitStore {
       CREATE TABLE IF NOT EXISTS author_insights (
         author_id INTEGER PRIMARY KEY REFERENCES authors(id), summary TEXT NOT NULL,
         evidence TEXT NOT NULL, generated_at TEXT NOT NULL, commit_count INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS commit_stats (
+        repository TEXT NOT NULL, sha TEXT NOT NULL, additions INTEGER, deletions INTEGER,
+        changed_files INTEGER, checked_at TEXT NOT NULL,
+        PRIMARY KEY(repository, sha), FOREIGN KEY(repository, sha) REFERENCES commits(repository, sha)
       );
     `);
   }
@@ -118,6 +123,23 @@ export class CommitStore {
     this.db.prepare("UPDATE commits SET summary = ? WHERE repository = ? AND sha = ?").run(summary, repository, sha);
   }
 
+  setCommitStats(repository: string, sha: string, stats: { additions: number; deletions: number; changedFiles: number | null } | null): void {
+    this.db.prepare(`INSERT INTO commit_stats(repository, sha, additions, deletions, changed_files, checked_at)
+      VALUES (?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      ON CONFLICT(repository, sha) DO UPDATE SET additions = excluded.additions, deletions = excluded.deletions,
+      changed_files = excluded.changed_files, checked_at = excluded.checked_at`)
+      .run(repository, sha, stats?.additions ?? null, stats?.deletions ?? null, stats?.changedFiles ?? null);
+  }
+
+  recentCommitsNeedingStats(id: number, limit = 10): { repository: string; sha: string }[] {
+    return this.db.prepare(`SELECT recent.repository, recent.sha FROM (SELECT c.repository, c.sha FROM commits c JOIN authors a ON a.id = c.author_id
+      WHERE (a.id = ? OR a.merged_into = ?) AND datetime(c.committed_at) >= datetime('now', '-30 days')
+      ORDER BY c.committed_at DESC LIMIT ?) recent
+      LEFT JOIN commit_stats s ON s.repository = recent.repository AND s.sha = recent.sha
+      WHERE s.checked_at IS NULL OR (s.additions IS NULL AND datetime(s.checked_at) < datetime('now', '-1 hour'))`)
+      .all(id, id, limit) as { repository: string; sha: string }[];
+  }
+
   authors(): Author[] {
     return this.db.prepare(`SELECT a.id, a.name, a.github_login, a.hidden, a.merged_into,
       COUNT(c.sha) AS commits, MAX(c.committed_at) AS last_commit,
@@ -131,7 +153,7 @@ export class CommitStore {
     const where = "(a.id = ? OR a.merged_into = ?) AND datetime(c.committed_at) >= datetime('now', '-30 days')";
     const days = this.db.prepare(`SELECT date(c.committed_at, '+3 hours') AS day, COUNT(*) AS commits FROM commits c JOIN authors a ON a.id = c.author_id WHERE ${where} GROUP BY day ORDER BY day`).all(id, id) as { day: string; commits: number }[];
     const repositories = this.db.prepare(`SELECT c.repository, COUNT(*) AS commits FROM commits c JOIN authors a ON a.id = c.author_id WHERE ${where} GROUP BY c.repository ORDER BY commits DESC, c.repository`).all(id, id) as { repository: string; commits: number }[];
-    const recent = this.db.prepare(`SELECT c.*, a.name AS author_name FROM commits c JOIN authors a ON a.id = c.author_id WHERE ${where} ORDER BY c.committed_at DESC LIMIT 500`).all(id, id) as CommitRow[];
+    const recent = this.db.prepare(`SELECT c.*, a.name AS author_name, s.additions, s.deletions, s.changed_files FROM commits c JOIN authors a ON a.id = c.author_id LEFT JOIN commit_stats s ON s.repository = c.repository AND s.sha = c.sha WHERE ${where} ORDER BY c.committed_at DESC LIMIT 500`).all(id, id) as CommitRow[];
     return { activeDays: days.length, repositoryCount: repositories.length, days, repositories, recent };
   }
 
@@ -141,7 +163,7 @@ export class CommitStore {
   }
 
   authorCommitBySha(id: number, sha: string): CommitRow | undefined {
-    return this.db.prepare(`SELECT c.*, a.name AS author_name FROM commits c JOIN authors a ON a.id = c.author_id
+    return this.db.prepare(`SELECT c.*, a.name AS author_name, s.additions, s.deletions, s.changed_files FROM commits c JOIN authors a ON a.id = c.author_id LEFT JOIN commit_stats s ON s.repository = c.repository AND s.sha = c.sha
       WHERE c.sha = ? AND (a.id = ? OR a.merged_into = ?) LIMIT 1`).get(sha, id, id) as CommitRow | undefined;
   }
 
@@ -174,7 +196,7 @@ export class CommitStore {
     if (filters.from) { conditions.push("datetime(c.committed_at, '+3 hours') >= datetime(?)"); values.push(`${filters.from}T00:00:00Z`); }
     if (filters.to) { conditions.push("datetime(c.committed_at, '+3 hours') < datetime(?, '+1 day')"); values.push(`${filters.to}T00:00:00Z`); }
     const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
-    return this.db.prepare(`SELECT c.*, a.name AS author_name FROM commits c JOIN authors a ON a.id = c.author_id ${where}
+    return this.db.prepare(`SELECT c.*, a.name AS author_name, s.additions, s.deletions, s.changed_files FROM commits c JOIN authors a ON a.id = c.author_id LEFT JOIN commit_stats s ON s.repository = c.repository AND s.sha = c.sha ${where}
       ORDER BY c.committed_at DESC LIMIT 50 OFFSET ?`).all(...values, Math.max(0, (filters.page ?? 1) - 1) * 50) as CommitRow[];
   }
 
