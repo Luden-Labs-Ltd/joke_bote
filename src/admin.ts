@@ -120,7 +120,7 @@ export async function handleAdmin(request: IncomingMessage, response: ServerResp
     const id = Number(profile[1]);
     const author = combinedAuthors(store.authors()).find((person) => person.id === id);
     if (!author) { response.writeHead(404).end(); return true; }
-    if (config.githubApiToken) await loadRecentCommitStats(store, id, config.githubApiToken);
+    if (config.githubApiToken) await loadCommitStats(store, store.recentCommitsNeedingStats(id), config.githubApiToken);
     const activity = store.authorActivity(id);
     const insight = store.authorInsight(id);
     const evidence = (insight?.evidence ?? []).map((sha) => store.authorCommitBySha(id, sha)).filter((commit) => commit !== undefined);
@@ -171,13 +171,19 @@ export async function handleAdmin(request: IncomingMessage, response: ServerResp
     const from = validDate(url.searchParams.get("from"));
     const to = validDate(url.searchParams.get("to"));
     const currentPage = Math.max(1, Number(url.searchParams.get("page")) || 1);
-    const commits = store.commits({ author, repository, from, to, page: currentPage });
+    const filters = { author, repository, from, to, page: currentPage };
+    let commits = store.commits(filters);
+    if (author && config.githubApiToken) {
+      const pending = store.commitsNeedingStats(commits);
+      for (let offset = 0; offset < pending.length; offset += 20) await loadCommitStats(store, pending.slice(offset, offset + 20), config.githubApiToken);
+      if (pending.length) commits = store.commits(filters);
+    }
     const content = `${selectedAuthor ? `<a class="back-link" href="/admin/people/${selectedAuthor.id}">← ${escapeHtml(selectedAuthor.name)}</a>` : ""}<h1>История коммитов</h1>${selectedAuthor && repository ? `<p class="muted">${escapeHtml(selectedAuthor.name)} · ${escapeHtml(repository)}</p>` : ""}<form class="filters" method="get" action="/admin/commits">
       <select name="author" aria-label="Сотрудник"><option value="">Все авторы</option>${authors.map((person) => `<option value="${person.id}" ${person.id === author ? "selected" : ""}>${escapeHtml(person.name)}</option>`).join("")}</select>
       <select name="repository" aria-label="Проект"><option value="">Все проекты</option>${repositories.map((name) => `<option value="${escapeHtml(name)}" ${name === repository ? "selected" : ""}>${escapeHtml(name)}</option>`).join("")}</select>
       <label>С <input type="date" name="from" value="${from ?? ""}"></label><label>По <input type="date" name="to" value="${to ?? ""}"></label><button>Показать</button></form>
       <p class="muted commit-hint">Под заголовком показывается описание, если оно есть в сообщении коммита или создано ботом.</p>
-      ${commits.map((commit) => `<article class="commit"><div><a href="${escapeHtml(commit.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(commit.message.split("\n")[0])}</a><p>${escapeHtml(commit.author_name)} · ${escapeHtml(commit.repository)} · ${date(commit.committed_at)} · ${escapeHtml(commit.sha.slice(0, 8))}</p>${commitDescription(commit)}${commitSize(commit)}</div></article>`).join("") || "Коммиты не найдены."}
+      ${commits.map((commit) => `<article class="commit"><div><a href="${escapeHtml(commit.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(commit.message.split("\n")[0])}</a><p>${escapeHtml(commit.author_name)} · ${escapeHtml(commit.repository)} · ${date(commit.committed_at)} · ${escapeHtml(commit.sha.slice(0, 8))}</p>${commitDescription(commit)}${commitSize(commit, Boolean(author))}</div></article>`).join("") || "Коммиты не найдены."}
       <nav class="pagination">${currentPage > 1 ? `<a href="${pageUrl(url, currentPage - 1)}">← Назад</a>` : ""}<span>Страница ${currentPage}</span>${commits.length === 50 ? `<a href="${pageUrl(url, currentPage + 1)}">Вперёд →</a>` : ""}</nav>`;
     sendHtml(response, page("Коммиты", content, true, csrf));
     return true;
@@ -231,8 +237,7 @@ function dayCommitsUrl(id: number, day: string): string {
   return `/admin/commits?author=${id}&from=${day}&to=${day}`;
 }
 
-async function loadRecentCommitStats(store: CommitStore, id: number, token: string): Promise<void> {
-  const missing = store.recentCommitsNeedingStats(id);
+async function loadCommitStats(store: CommitStore, missing: { repository: string; sha: string }[], token: string): Promise<void> {
   await Promise.all(missing.map(async ({ repository, sha }) => {
     const [owner, repo] = repository.split("/", 2);
     if (!owner || !repo) return;

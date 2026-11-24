@@ -179,6 +179,7 @@ test("employee profile loads and caches size of historical commits", async () =>
   const config = { email: "admin@example.com", passwordHash: "unused:unused", sessionSecret: randomBytes(32).toString("hex"), githubApiToken: "fake-token" };
   const sha = "a".repeat(40);
   store.upsertCommit({ repository: "org/app", sha, message: "Fix search\n\nHandle empty results", committedAt: new Date().toISOString(), authorName: "Alice", authorLogin: "alice", url: `https://github.com/org/app/commit/${sha}` });
+  store.upsertCommit({ repository: "org/app", sha: "b".repeat(40), message: "Old release", committedAt: new Date(Date.now() - 40 * 86_400_000).toISOString(), authorName: "Alice", authorLogin: "alice", url: `https://github.com/org/app/commit/${"b".repeat(40)}` });
   const server = createServer((request, response) => { void handleAdmin(request, response, store, config); });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const originalFetch = globalThis.fetch;
@@ -186,7 +187,7 @@ test("employee profile loads and caches size of historical commits", async () =>
   globalThis.fetch = async (input, options) => {
     if (String(input).startsWith("https://api.github.com/")) {
       githubCalls += 1;
-      assert.match(String(input), /org\/app\/commits\/a{40}/);
+      assert.match(String(input), /org\/app\/commits\/[ab]{40}/);
       return new Response(JSON.stringify({ stats: { additions: 124, deletions: 9 }, files: [{}, {}] }), { status: 200 });
     }
     return originalFetch(input, options);
@@ -201,6 +202,10 @@ test("employee profile loads and caches size of historical commits", async () =>
     assert.match(first, /Handle empty results/);
     await fetch(url, { headers: { Cookie: cookie } });
     assert.equal(githubCalls, 1);
+    const history = await (await fetch(`http://127.0.0.1:${server.address().port}/admin/commits?author=${store.authors()[0].id}`, { headers: { Cookie: cookie } })).text();
+    assert.match(history, /Old release/);
+    assert.match(history, /2 файла · <span>\+124<\/span> \/ <span>−9<\/span> строк/);
+    assert.equal(githubCalls, 2);
   } finally {
     globalThis.fetch = originalFetch;
     await new Promise((resolve) => server.close(resolve));

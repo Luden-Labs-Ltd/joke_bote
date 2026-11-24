@@ -140,6 +140,15 @@ export class CommitStore {
       .all(id, id, limit) as { repository: string; sha: string }[];
   }
 
+  commitsNeedingStats(commits: CommitRow[]): { repository: string; sha: string }[] {
+    const lookup = this.db.prepare("SELECT additions, checked_at FROM commit_stats WHERE repository = ? AND sha = ?");
+    const retryBefore = Date.now() - 60 * 60 * 1000;
+    return commits.filter((commit) => {
+      const stats = lookup.get(commit.repository, commit.sha) as { additions: number | null; checked_at: string } | undefined;
+      return !stats || (stats.additions === null && Date.parse(stats.checked_at) < retryBefore);
+    }).map(({ repository, sha }) => ({ repository, sha }));
+  }
+
   authors(): Author[] {
     return this.db.prepare(`SELECT a.id, a.name, a.github_login, a.hidden, a.merged_into,
       COUNT(c.sha) AS commits, MAX(c.committed_at) AS last_commit,
