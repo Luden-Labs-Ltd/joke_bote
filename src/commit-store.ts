@@ -159,9 +159,13 @@ export class CommitStore {
 
   mergeAuthor(source: number, target: number): void {
     if (source === target) throw new Error("Choose two different authors");
-    const targetRow = this.db.prepare("SELECT id FROM authors WHERE id = ? AND merged_into IS NULL").get(target);
-    if (!targetRow) throw new Error("Target author does not exist");
-    this.db.prepare("UPDATE authors SET merged_into = ?, hidden = 1 WHERE id = ? AND merged_into IS NULL").run(target, source);
+    this.db.transaction(() => {
+      const targetRow = this.db.prepare("SELECT id FROM authors WHERE id = ? AND merged_into IS NULL").get(target);
+      const sourceRow = this.db.prepare("SELECT id FROM authors WHERE id = ? AND merged_into IS NULL").get(source);
+      if (!targetRow || !sourceRow) throw new Error("Choose two existing unmerged authors");
+      this.db.prepare("UPDATE authors SET merged_into = ? WHERE merged_into = ?").run(target, source);
+      this.db.prepare("UPDATE authors SET merged_into = ?, hidden = 1 WHERE id = ?").run(target, source);
+    })();
   }
 
   unmergeAuthor(id: number): void {

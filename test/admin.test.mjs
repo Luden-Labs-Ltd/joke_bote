@@ -27,6 +27,11 @@ test("commit storage deduplicates pushes, keeps authors and aggregates merged au
     assert.equal(store.trend(30).reduce((sum, row) => sum + row.commits, 0), 0);
     store.unmergeAuthor(authors[1].id);
     assert.equal(store.authors().find((author) => author.id === authors[1].id).merged_into, null);
+    store.upsertCommit({ ...first, sha: "f".repeat(40), authorName: "Alice Home", authorLogin: "alice-home" });
+    const third = store.authors().find((author) => author.github_login === "alice-home");
+    store.mergeAuthor(third.id, authors[1].id);
+    store.mergeAuthor(authors[1].id, authors[0].id);
+    assert.equal(store.commits({ author: authors[0].id }).length, 3);
   } finally {
     rmSync(folder, { recursive: true, force: true });
   }
