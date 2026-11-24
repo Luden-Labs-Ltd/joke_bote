@@ -6,6 +6,9 @@ import type { IncomingMessage } from "node:http";
 import { dirname } from "node:path";
 import { Context, Markup, Telegraf } from "telegraf";
 import { captureException, initSentry } from "./sentry.js";
+import { CommitStore } from "./commit-store.js";
+import { handleAdmin } from "./admin.js";
+import { startGitHubHistory } from "./github-history.js";
 
 dotenv.config();
 initSentry();
@@ -33,6 +36,11 @@ const dailySummaryChatIds = parseChatIds(process.env.DAILY_SUMMARY_CHAT_IDS ?? p
 const githubWebhookSecret = process.env.GITHUB_WEBHOOK_SECRET?.trim();
 const githubCommitChatIds = parseChatIds(process.env.GITHUB_COMMIT_CHAT_IDS);
 const githubApiToken = process.env.GITHUB_API_TOKEN?.trim();
+const githubOrganization = process.env.GITHUB_ORGANIZATION?.trim() || "Luden-Labs-Ltd";
+const adminEmail = process.env.ADMIN_EMAIL?.trim() || "";
+const adminPasswordHash = process.env.ADMIN_PASSWORD_HASH?.trim() || "";
+const adminSessionSecret = process.env.ADMIN_SESSION_SECRET?.trim() || "";
+const commitStore = new CommitStore(process.env.COMMIT_DB_FILE?.trim() || `${persistentStateDirectory}/commits.sqlite`);
 const geminiApiKey = process.env.GEMINI_API_KEY?.trim();
 const geminiModel = process.env.GEMINI_MODEL?.trim() || "gemini-2.5-flash";
 const githubCommitModel = process.env.GEMINI_COMMIT_MODEL?.trim() || "gemini-2.5-flash";
@@ -411,6 +419,7 @@ async function initializeManagerBot(): Promise<void> {
   scheduleMeetingTestAnnouncement();
   scheduleMeetingSummaryChecks();
   scheduleNextDailySummary();
+  startGitHubHistory(commitStore, githubApiToken, githubOrganization);
 }
 
 startGitHubWebhookServer();
@@ -420,6 +429,14 @@ process.once("SIGTERM", () => bot.stop("SIGTERM"));
 
 function startGitHubWebhookServer(): void {
   createServer(async (request, response) => {
+    try {
+      if (await handleAdmin(request, response, commitStore, { email: adminEmail, passwordHash: adminPasswordHash, sessionSecret: adminSessionSecret })) return;
+    } catch (error) {
+      captureException(error, "admin.request");
+      console.error("Admin request failed", error);
+      if (!response.headersSent) response.writeHead(400).end("Invalid admin request");
+      return;
+    }
     if (request.method !== "POST" || request.url !== "/webhooks/github") {
       response.writeHead(404).end();
       return;
@@ -443,8 +460,33 @@ function startGitHubWebhookServer(): void {
       }
 
       const payload = JSON.parse(payloadBody.toString("utf8")) as GitHubPushPayload;
+      if (!payload.repository?.full_name || !Array.isArray(payload.commits)) {
+        response.writeHead(400).end("Invalid push payload");
+        return;
+      }
+      const newRepository = !commitStore.hasRepository(payload.repository.full_name);
+      const fresh = payload.commits.filter((commit) => {
+        if (!/^[a-f0-9]{40}$/i.test(commit.id) || !commit.author) return false;
+        commitStore.upsertCommit({
+          repository: payload.repository.full_name,
+          sha: commit.id,
+          message: commit.message,
+          committedAt: commit.timestamp ?? new Date().toISOString(),
+          authorName: commit.author.name || commit.author.username || "Unknown",
+          authorEmail: commit.author.email,
+          authorLogin: commit.author.username,
+          url: `${payload.repository.html_url}/commit/${commit.id}`,
+        });
+        return commitStore.markWebhookSeen(payload.repository.full_name, commit.id);
+      });
       response.writeHead(202).end("Accepted");
-      void announceGitHubPush(payload);
+      if (fresh.length > 0) void announceGitHubPush({ ...payload, commits: fresh }).catch((error: unknown) => {
+        captureException(error, "github.announce");
+        console.error("GitHub push announcement failed", error);
+      });
+      if (newRepository) {
+        startGitHubHistory(commitStore, githubApiToken, githubOrganization);
+      }
     } catch (error) {
       captureException(error, "github.webhook");
       console.error("GitHub webhook handling failed", error);
@@ -491,9 +533,11 @@ async function announceGitHubPush(payload: GitHubPushPayload): Promise<void> {
     return;
   }
 
-  const messages = await Promise.all(
-    payload.commits.map(async (commit) => formatGitHubCommitMessage(payload, commit, await summarizeGitHubCommit(payload, commit))),
-  );
+  const messages = await Promise.all(payload.commits.map(async (commit) => {
+    const analysis = await summarizeGitHubCommit(payload, commit);
+    commitStore.setSummary(payload.repository.full_name, commit.id, analysis.summary);
+    return formatGitHubCommitMessage(payload, commit, analysis);
+  }));
   const results = await Promise.allSettled(
     [...githubCommitChatIds].flatMap((chatId) =>
       messages.map((text) => bot.telegram.sendMessage(chatId, text, { parse_mode: "HTML", link_preview_options: { is_disabled: true } })),
@@ -1890,12 +1934,14 @@ function getChatLogInfo(chat: {
 type GitHubCommit = {
   id: string;
   message: string;
+  timestamp?: string;
   added?: string[];
   modified?: string[];
   removed?: string[];
   author: {
     name: string;
     username?: string;
+    email?: string;
   };
 };
 

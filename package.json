@@ -6,14 +6,18 @@
   "scripts": {
     "dev": "tsx src/index.ts",
     "build": "tsc -p tsconfig.json",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "admin:hash-password": "node scripts/hash-admin-password.mjs",
+    "test": "npm run build && node --test test/*.test.mjs"
   },
   "dependencies": {
     "@sentry/node": "^10.73.0",
+    "better-sqlite3": "^12.11.1",
     "dotenv": "^16.6.1",
     "telegraf": "^4.16.3"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^24.0.8",
     "tsx": "^4.20.3",
     "typescript": "^5.8.3"
