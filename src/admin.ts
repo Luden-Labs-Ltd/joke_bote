@@ -1,8 +1,9 @@
 import { createHmac, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Author, CommitStore } from "./commit-store.js";
+import { generateAuthorInsight } from "./author-insight.js";
 
-type AdminConfig = { email: string; passwordHash: string; sessionSecret: string };
+type AdminConfig = { email: string; passwordHash: string; sessionSecret: string; geminiApiKey?: string; geminiModel?: string };
 const failedLogins = new Map<string, { attempts: number; until: number }>();
 
 export async function handleAdmin(request: IncomingMessage, response: ServerResponse, store: CommitStore, config: AdminConfig): Promise<boolean> {
@@ -67,6 +68,20 @@ export async function handleAdmin(request: IncomingMessage, response: ServerResp
     if (!validCsrf(form, session, config.sessionSecret)) { response.writeHead(403).end(); return true; }
     const id = Number(form.get("id"));
     try {
+      if (url.pathname === "/admin/insight" && Number.isSafeInteger(id) && id > 0) {
+        const author = combinedAuthors(store.authors()).find((person) => person.id === id);
+        if (!author) { response.writeHead(404).end(); return true; }
+        if (!config.geminiApiKey) { redirect(response, `/admin/people/${id}?insight_error=unavailable`); return true; }
+        try {
+          const insight = await generateAuthorInsight(author.name, store.authorActivity(id), config.geminiApiKey, config.geminiModel || "gemini-2.5-flash");
+          store.saveAuthorInsight(id, insight.summary, insight.evidence, author.last_30);
+          redirect(response, `/admin/people/${id}`);
+        } catch (error) {
+          console.error("Author insight failed", { authorId: id, error });
+          redirect(response, `/admin/people/${id}?insight_error=failed`);
+        }
+        return true;
+      }
       if (url.pathname === "/admin/hide" && Number.isSafeInteger(id)) store.setHidden(id, form.get("hidden") === "1");
       else if (url.pathname === "/admin/merge" && Number.isSafeInteger(id)) store.mergeAuthor(id, Number(form.get("target")));
       else if (url.pathname === "/admin/unmerge" && Number.isSafeInteger(id)) store.unmergeAuthor(id);
@@ -89,27 +104,56 @@ export async function handleAdmin(request: IncomingMessage, response: ServerResp
       return { day, commits: recorded.get(day) ?? 0 };
     });
     const max = Math.max(1, ...trend.map((row) => row.commits));
-    const weekdays = store.weekdays();
-    const names = ["Вс", "Пн", "Вт", "Ср", "Чт", "Пт", "Сб"];
-    const content = `<h1>Активность команды</h1><div class="cards">
-      <article><span>За 7 дней</span><strong>${total7}</strong></article><article><span>За 30 дней</span><strong>${total30}</strong></article>
-      <article><span>Сотрудников</span><strong>${authors.length}</strong></article><article><span>Репозиториев</span><strong>${repositories.length}</strong></article></div>
-      <section><h2>Коммиты за 30 дней</h2><div class="chart">${trend.map((row, index) => `<div class="bar-wrap" title="${escapeHtml(row.day)}: ${row.commits}"><div class="bar" style="height:${row.commits ? Math.max(4, row.commits / max * 100) : 0}%"></div><small>${index % 5 === 0 || index === 29 ? escapeHtml(row.day.slice(5)) : ""}</small></div>`).join("")}</div></section>
-      <div class="columns"><section><h2>По сотрудникам · 30 дней</h2>${authorTable(authors.slice(0, 20))}</section>
-      <section><h2>По дням недели · вся история</h2>${names.map((name, index) => `<div class="stat-line"><span>${name}</span><strong>${weekdays.find((row) => row.weekday === index)?.commits ?? 0}</strong></div>`).join("")}</section></div>
-      <section><h2>Репозитории</h2>${repositories.map((repo) => `<div class="stat-line"><span>${escapeHtml(repo.full_name)}</span><strong>${repo.commit_count}</strong></div>`).join("")}</section>`;
+    const top = authors.filter((author) => author.last_30 > 0).slice(0, 5).map((author, index) => ({ ...author, rank: index + 1, activity: store.authorActivity(author.id) }));
+    const loading = repositories.some((repo) => repo.status !== "complete");
+    const content = `<div class="page-title"><div><h1>Команда за 30 дней</h1><p class="muted">Коммиты показывают активность, а не качество работы.</p></div><a href="/admin/people">Все сотрудники →</a></div>
+      ${loading ? '<p class="notice">История репозиториев ещё загружается. Цифры могут увеличиться.</p>' : ""}
+      <div class="cards"><article><span>Коммитов за 30 дней</span><strong>${total30}</strong></article><article><span>За 7 дней</span><strong>${total7}</strong></article><article><span>Сотрудников</span><strong>${authors.length}</strong></article><article><span>Репозиториев</span><strong>${repositories.length}</strong></article></div>
+      <section><div class="section-heading"><h2>Топ сотрудников · 30 дней</h2><small>По числу коммитов</small></div>${top.length ? top.map((person) => `<a class="leader-row" href="/admin/people/${person.id}"><span class="rank">${person.rank}</span><span class="leader-name"><strong>${escapeHtml(person.name)}</strong><small>${person.activity.activeDays} ${plural(person.activity.activeDays, "активный день", "активных дня", "активных дней")} · ${person.activity.repositoryCount} ${plural(person.activity.repositoryCount, "проект", "проекта", "проектов")}</small></span><strong class="leader-count">${person.last_30}</strong><span class="leader-label">коммитов</span></a>`).join("") : '<p class="muted">За последние 30 дней коммитов пока нет.</p>'}<a class="section-link" href="/admin/people">Посмотреть всех сотрудников →</a></section>
+      <section><h2>Динамика коммитов · 30 дней</h2><div class="chart">${trend.map((row, index) => `<div class="bar-wrap" title="${escapeHtml(row.day)}: ${row.commits}"><div class="bar" style="height:${row.commits ? Math.max(4, row.commits / max * 100) : 0}%"></div><small>${index % 5 === 0 || index === 29 ? escapeHtml(row.day.slice(5)) : ""}</small></div>`).join("")}</div></section>`;
     sendHtml(response, page("Обзор", content, true, csrf));
+    return true;
+  }
+
+  const profile = url.pathname.match(/^\/admin\/people\/(\d+)$/);
+  if (profile) {
+    const id = Number(profile[1]);
+    const author = combinedAuthors(store.authors()).find((person) => person.id === id);
+    if (!author) { response.writeHead(404).end(); return true; }
+    const activity = store.authorActivity(id);
+    const insight = store.authorInsight(id);
+    const evidence = (insight?.evidence ?? []).map((sha) => store.authorCommitBySha(id, sha)).filter((commit) => commit !== undefined);
+    const days = new Map(activity.days.map((row) => [row.day, row.commits]));
+    const chart = Array.from({ length: 30 }, (_, index) => {
+      const day = new Date(Date.now() + 3 * 60 * 60 * 1000 - (29 - index) * 86_400_000).toISOString().slice(0, 10);
+      return { day, commits: days.get(day) ?? 0 };
+    });
+    const max = Math.max(1, ...chart.map((row) => row.commits));
+    const loading = store.repositories().some((repo) => repo.status !== "complete");
+    const content = `<a class="back-link" href="/admin/people">← Все сотрудники</a><h1>${escapeHtml(author.name)}</h1><p class="muted">Последний коммит: ${date(author.last_commit)} · Активный день = день с хотя бы одним коммитом.</p>
+      ${loading ? '<p class="notice">История ещё загружается. Цифры могут увеличиться.</p>' : ""}
+      <div class="cards profile-cards"><article><span>Коммитов за 30 дней</span><strong>${author.last_30}</strong></article><article><span>Активных дней</span><strong>${activity.activeDays}</strong></article><article><span>За 7 дней</span><strong>${author.last_7}</strong></article><article><span>Проектов за 30 дней</span><strong>${activity.repositoryCount}</strong></article></div>
+      <section><h2>Активность по дням · 30 дней</h2><div class="chart">${chart.map((row, index) => `<div class="bar-wrap" title="${escapeHtml(row.day)}: ${row.commits}"><div class="bar" style="height:${row.commits ? Math.max(4, row.commits / max * 100) : 0}%"></div><small>${index % 5 === 0 || index === 29 ? escapeHtml(row.day.slice(5)) : ""}</small></div>`).join("")}</div></section>
+      <div class="profile-columns"><section><h2>Проекты за 30 дней</h2>${activity.repositories.map((repo) => `<div class="stat-line"><span>${escapeHtml(repo.repository)}</span><strong>${repo.commits}</strong></div>`).join("") || '<p class="muted">Пока нет коммитов.</p>'}</section>
+      <section><h2>Итог по коммитам</h2><p class="muted">ИИ описывает темы работы по доступным коммитам. Это не оценка сотрудника.</p>${url.searchParams.has("insight_error") ? '<p class="error">Не удалось создать итог. Попробуйте позже; предыдущий итог сохранён.</p>' : ""}
+      ${insight ? `<p>${escapeHtml(insight.summary)}</p><small>Составлено ${date(insight.generated_at)} · на момент итога: ${insight.commit_count} коммитов за 30 дней</small><div class="evidence">${evidence.map((commit) => `<a href="${escapeHtml(commit.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(commit.message.split("\n")[0].slice(0, 95))} ↗</a>`).join("")}</div>` : '<p class="muted">Итог ещё не составлен.</p>'}
+      <form method="post" action="/admin/insight"><input type="hidden" name="csrf" value="${csrf}"><input type="hidden" name="id" value="${id}"><button ${author.last_30 ? "" : "disabled"}>${insight ? "Обновить итог" : "Составить итог за 30 дней"}</button></form></section></div>
+      <section><div class="section-heading"><h2>Последние коммиты</h2><a href="/admin/commits?author=${id}">Вся история →</a></div>${activity.recent.slice(0, 10).map((commit) => `<div class="recent-commit"><a href="${escapeHtml(commit.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(commit.message.split("\n")[0])}</a><small>${escapeHtml(commit.repository)} · ${date(commit.committed_at)}</small></div>`).join("") || '<p class="muted">За последние 30 дней коммитов нет.</p>'}</section>`;
+    sendHtml(response, page(author.name, content, true, csrf));
     return true;
   }
 
   if (url.pathname === "/admin/people") {
     const all = store.authors();
+    const authors = combinedAuthors(all);
     const targets = all.filter((author) => !author.merged_into);
-    const content = `<h1>Сотрудники и авторы</h1><p class="muted">Авторы добавляются из коммитов автоматически. Скрытые авторы не входят в сводку.</p>
+    const content = `<h1>Сотрудники</h1><p class="muted">За последние 30 дней. Рейтинг — по коммитам; активные дни и проекты дают контекст.</p>
+      <section class="people-list"><div class="people-head"><span>Сотрудник</span><span>Коммиты</span><span>Дни</span><span>Проекты</span><span>Последний</span></div><div class="people-mobile-head"><span>Сотрудник</span><span>Коммиты</span><span>Дни</span></div>${authors.map((author) => { const activity = store.authorActivity(author.id); return `<a class="people-row" href="/admin/people/${author.id}"><span class="people-person"><strong>${escapeHtml(author.name)}</strong><small>${activity.repositoryCount} ${plural(activity.repositoryCount, "проект", "проекта", "проектов")}</small></span><span>${author.last_30}</span><span>${activity.activeDays}</span><span>${activity.repositoryCount}</span><small>${date(author.last_commit)}</small></a>`; }).join("") || '<p class="muted">Пока нет сотрудников.</p>'}</section>
+      <details class="management"><summary>Управление авторами</summary><p class="muted">Авторы добавляются автоматически. Скрытые не входят в сводку; объединённые учитываются как один сотрудник.</p>
       ${all.map((author) => `<article class="person"><div><a href="/admin/commits?author=${author.id}">${escapeHtml(author.name)}</a> ${author.github_login ? `<small>@${escapeHtml(author.github_login)}</small>` : ""}
       ${author.hidden ? `<small>Скрыт${author.merged_into ? " · объединён" : ""}</small>` : ""}<p>${author.commits} коммитов · за 30 дней: ${author.last_30} · последний: ${date(author.last_commit)}</p></div>
       ${author.merged_into ? `<form method="post" action="/admin/unmerge"><input type="hidden" name="csrf" value="${csrf}"><input type="hidden" name="id" value="${author.id}"><button>Разъединить</button></form>` : `<form method="post" action="/admin/hide"><input type="hidden" name="csrf" value="${csrf}"><input type="hidden" name="id" value="${author.id}"><input type="hidden" name="hidden" value="${author.hidden ? 0 : 1}"><button>${author.hidden ? "Показать" : "Скрыть"}</button></form>`}
-      ${!author.merged_into && targets.length > 1 ? `<form method="post" action="/admin/merge"><input type="hidden" name="csrf" value="${csrf}"><input type="hidden" name="id" value="${author.id}"><select name="target" required><option value="">Объединить с…</option>${targets.filter((target) => target.id !== author.id).map((target) => `<option value="${target.id}">${escapeHtml(target.name)}</option>`).join("")}</select><button>Объединить</button></form>` : ""}</article>`).join("") || "Пока нет авторов."}`;
+      ${!author.merged_into && targets.length > 1 ? `<form method="post" action="/admin/merge"><input type="hidden" name="csrf" value="${csrf}"><input type="hidden" name="id" value="${author.id}"><select name="target" required><option value="">Объединить с…</option>${targets.filter((target) => target.id !== author.id).map((target) => `<option value="${target.id}">${escapeHtml(target.name)}</option>`).join("")}</select><button>Объединить</button></form>` : ""}</article>`).join("") || "Пока нет авторов."}</details>`;
     sendHtml(response, page("Сотрудники", content, true, csrf));
     return true;
   }
@@ -168,13 +212,15 @@ function loginPage(error: boolean): string {
 }
 
 function page(title: string, content: string, authenticated: boolean, csrf = ""): string {
-  return `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)} · Manager Bot</title><style>${css}${mobileHeaderCss}</style></head><body>
+  return `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)} · Manager Bot</title><style>${css}${mobileHeaderCss}${dashboardCss}${polishCss}</style></head><body>
     ${authenticated ? `<header><a class="brand" href="/admin">Manager Bot</a><nav><a href="/admin">Обзор</a><a href="/admin/people">Сотрудники</a><a href="/admin/commits">Коммиты</a><a href="/admin/import">Загрузка</a></nav><form method="post" action="/admin/logout"><input type="hidden" name="csrf" value="${csrf}"><button class="quiet">Выйти</button></form></header>` : ""}
     <main>${content}</main></body></html>`;
 }
 
 const css = `:root{color-scheme:light dark;font-family:Inter,system-ui,sans-serif;background:#f5f7fb;color:#172033}*{box-sizing:border-box}body{margin:0}header{display:flex;align-items:center;gap:24px;padding:16px max(20px,calc((100vw - 1180px)/2));background:#fff;border-bottom:1px solid #dde3eb}header nav{display:flex;gap:20px;flex:1;flex-wrap:wrap}.brand{font-weight:750;font-size:18px}a{color:#305cb8;text-decoration:none}header a{color:inherit}a:hover{text-decoration:underline}main{max-width:1180px;margin:36px auto;padding:0 20px}h1{font-size:30px;margin:0 0 24px}h2{font-size:18px;margin:0 0 16px}p{line-height:1.5}.muted,small,.commit p,.person p{color:#647084}section,article{background:#fff;border:1px solid #e0e6ef;border-radius:14px;padding:20px;margin-bottom:18px}.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:16px}.cards article{display:flex;flex-direction:column;gap:14px}.cards strong{font-size:32px}.columns{display:grid;grid-template-columns:2fr 1fr;gap:18px}.chart{height:170px;display:flex;align-items:end;gap:5px;overflow:auto}.bar-wrap{height:100%;min-width:19px;flex:1;display:flex;flex-direction:column;justify-content:end;text-align:center;gap:5px}.bar{background:#4678db;border-radius:4px 4px 0 0}.bar-wrap small{font-size:9px;white-space:nowrap}.stat-line{display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid #eef1f5;gap:16px}.table-head,.table-row{display:grid;grid-template-columns:2fr 55px 60px 120px;gap:8px;padding:10px;border-bottom:1px solid #eef1f5}.table-head{color:#647084;font-size:12px}.person{display:flex;align-items:center;gap:16px;flex-wrap:wrap}.person>div{flex:1;min-width:230px}.person p,.commit p{margin:5px 0 0;font-size:13px}.person form{display:flex;gap:7px}.filters{display:flex;gap:10px;align-items:end;flex-wrap:wrap;margin-bottom:20px}.filters label,.login label{display:flex;flex-direction:column;gap:6px}input,select,button{font:inherit;border-radius:8px;border:1px solid #cbd5e1;padding:9px 12px;background:#fff;color:inherit}button{background:#305cb8;color:#fff;border-color:#305cb8;cursor:pointer}button.quiet{background:transparent;color:inherit;border:0}.login{max-width:390px;margin:12vh auto;background:#fff;padding:30px;border-radius:16px;border:1px solid #e0e6ef}.login form{display:grid;gap:18px}.login input{width:100%}.error{color:#bf3030}.pagination{display:flex;gap:18px;margin:20px 0}@media(max-width:800px){header{align-items:flex-start;flex-wrap:wrap}header nav{order:3;width:100%}.cards{grid-template-columns:repeat(2,1fr)}.columns{grid-template-columns:1fr}.table-head,.table-row{grid-template-columns:2fr 45px 55px 95px}}@media(max-width:480px){.cards{grid-template-columns:1fr 1fr}.table-head,.table-row{font-size:12px;grid-template-columns:1.5fr 35px 45px 75px}h1{font-size:25px}}@media(prefers-color-scheme:dark){:root{background:#111827;color:#edf2f8}header,section,article,.login{background:#1c2635;border-color:#334155}.muted,small,.commit p,.person p,.table-head{color:#a5b4c7}a{color:#92b5ff}header a{color:inherit}input,select{background:#111827;border-color:#475569}button{background:#638cf0;border-color:#638cf0;color:#0e1728}.stat-line,.table-head,.table-row{border-color:#334155}.bar{background:#7ca6ff}}`;
 const mobileHeaderCss = `@media(max-width:800px){header{display:grid;grid-template-columns:1fr auto;align-items:center;gap:14px}header nav{grid-column:1/-1;grid-row:2;width:auto;display:flex;gap:16px}header form{grid-column:2;grid-row:1}.person form{max-width:100%}}`;
+const dashboardCss = `.page-title,.section-heading{display:flex;align-items:baseline;justify-content:space-between;gap:16px}.page-title h1{margin-bottom:4px}.page-title{margin-bottom:22px}.page-title p{margin:0}.notice{padding:12px 16px;border:1px solid #d2b86d;border-radius:10px;background:#fff7df;color:#5d4611}.leader-row{display:grid;grid-template-columns:36px minmax(0,1fr) 65px 80px;align-items:center;gap:12px;padding:14px 2px;border-top:1px solid #eef1f5;color:inherit}.leader-row:hover,.people-row:hover{background:#f5f8fd;text-decoration:none}.rank{display:grid;place-items:center;width:30px;height:30px;border-radius:9px;background:#e9efff;color:#305cb8;font-weight:700}.leader-name{display:flex;flex-direction:column;gap:3px;min-width:0}.leader-name strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.leader-name small{font-size:12px}.leader-count{text-align:right;font-size:20px}.leader-label{color:#647084;font-size:13px}.section-link{display:block;margin-top:16px}.people-list{padding:8px 20px}.people-head,.people-row{display:grid;grid-template-columns:minmax(130px,2fr) repeat(3,minmax(60px,1fr)) minmax(130px,1.3fr);gap:12px;align-items:center;padding:13px 8px;border-bottom:1px solid #eef1f5}.people-head{color:#647084;font-size:12px}.people-row{color:inherit}.people-row span,.people-head span:not(:first-child){text-align:right}.people-row small{text-align:right}.management{margin:20px 0}.management summary{cursor:pointer;font-weight:650;padding:14px 0}.management .person{margin-bottom:10px}.back-link{display:inline-block;margin-bottom:14px}.profile-columns{display:grid;grid-template-columns:1fr 1fr;gap:18px}.profile-columns section{min-width:0}.evidence{display:flex;flex-direction:column;gap:8px;margin:12px 0 18px}.recent-commit{display:flex;flex-direction:column;gap:4px;padding:12px 0;border-top:1px solid #eef1f5}.recent-commit a{overflow-wrap:anywhere}.profile-columns .stat-line span{overflow-wrap:anywhere}button:disabled{opacity:.5;cursor:not-allowed}@media(max-width:800px){.profile-columns{grid-template-columns:1fr}}@media(max-width:600px){.people-head{display:none}.people-row{grid-template-columns:minmax(0,1fr) 56px 46px;gap:5px}.people-row span:nth-of-type(3),.people-row small{display:none}.people-row strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.people-list:before{content:'Сотрудник                                      Коммиты    Дни';display:block;white-space:pre;font-size:10px;color:#647084;overflow:hidden}.leader-row{grid-template-columns:30px minmax(0,1fr) 48px}.leader-label{display:none}.leader-count{font-size:18px}.page-title{align-items:flex-start}.page-title>a{font-size:13px;white-space:nowrap}}@media(prefers-color-scheme:dark){.notice{background:#3c3320;border-color:#846c3a;color:#f5deb0}.leader-row,.people-head,.people-row,.recent-commit{border-color:#334155}.leader-row:hover,.people-row:hover{background:#25344a}.rank{background:#263c68;color:#b8cbff}.leader-label{color:#a5b4c7}}`;
+const polishCss = `.people-person{display:flex;flex-direction:column;gap:3px;min-width:0;text-align:left!important}.people-person strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.people-person small{display:none;text-align:left}.people-row>span:nth-child(4){text-align:right}.people-mobile-head{display:none}@media(max-width:600px){.people-person small{display:block;font-size:11px}.people-row>span:nth-child(3){display:block}.people-row>span:nth-child(4),.people-row>small{display:none}.people-list:before,.people-list:after{content:none}.people-mobile-head{display:grid;grid-template-columns:minmax(0,1fr) 56px 46px;gap:5px;padding:6px 8px;color:#647084;font-size:10px}.people-mobile-head span:not(:first-child){text-align:right}.chart{gap:2px;overflow:visible}.bar-wrap{min-width:0}.bar-wrap small{font-size:7px}.bar{min-width:1px}}`;
 
 function getSession(request: IncomingMessage, secret: string): string | null {
   const cookie = request.headers.cookie?.split(";").map((item) => item.trim()).find((item) => item.startsWith("admin_session="))?.slice(14);
@@ -207,6 +253,7 @@ async function readForm(request: IncomingMessage): Promise<URLSearchParams> {
 function validDate(value: string | null): string | undefined { return value && /^\d{4}-\d{2}-\d{2}$/.test(value) ? value : undefined; }
 function pageUrl(url: URL, number: number): string { const copy = new URL(url); copy.searchParams.set("page", String(number)); return escapeHtml(copy.pathname + copy.search); }
 function date(value: string | null): string { return value ? new Intl.DateTimeFormat("ru-RU", { timeZone: "Europe/Minsk", day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" }).format(new Date(value)) : "—"; }
+function plural(value: number, one: string, few: string, many: string): string { const n = Math.abs(value) % 100; const digit = n % 10; return n >= 11 && n <= 14 ? many : digit === 1 ? one : digit >= 2 && digit <= 4 ? few : many; }
 function escapeHtml(value: string): string { return value.replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]!); }
 function sendHtml(response: ServerResponse, html: string, status = 200): void { response.writeHead(status, { "Content-Type": "text/html; charset=utf-8" }).end(html); }
 function redirect(response: ServerResponse, location: string): void { response.writeHead(303, { Location: location }).end(); }

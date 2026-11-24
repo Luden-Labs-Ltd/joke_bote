@@ -430,7 +430,7 @@ process.once("SIGTERM", () => bot.stop("SIGTERM"));
 function startGitHubWebhookServer(): void {
   createServer(async (request, response) => {
     try {
-      if (await handleAdmin(request, response, commitStore, { email: adminEmail, passwordHash: adminPasswordHash, sessionSecret: adminSessionSecret })) return;
+      if (await handleAdmin(request, response, commitStore, { email: adminEmail, passwordHash: adminPasswordHash, sessionSecret: adminSessionSecret, geminiApiKey, geminiModel: githubCommitModel })) return;
     } catch (error) {
       captureException(error, "admin.request");
       console.error("Admin request failed", error);

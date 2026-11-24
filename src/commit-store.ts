@@ -17,6 +17,8 @@ export type CommitInput = {
 export type Author = { id: number; name: string; github_login: string | null; hidden: number; merged_into: number | null; commits: number; last_commit: string | null; last_7: number; last_30: number };
 export type CommitRow = { repository: string; sha: string; message: string; committed_at: string; url: string; summary: string | null; author_id: number; author_name: string };
 export type Repository = { full_name: string; status: string; error: string | null; updated_at: string | null; commit_count: number };
+export type AuthorActivity = { activeDays: number; repositoryCount: number; days: { day: string; commits: number }[]; repositories: { repository: string; commits: number }[]; recent: CommitRow[] };
+export type AuthorInsight = { summary: string; evidence: string[]; generated_at: string; commit_count: number };
 
 export class CommitStore {
   private db: Database.Database;
@@ -52,6 +54,10 @@ export class CommitStore {
         repository TEXT NOT NULL REFERENCES repositories(full_name), branch TEXT NOT NULL,
         head_sha TEXT NOT NULL, page INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'pending',
         error TEXT, PRIMARY KEY(repository, branch)
+      );
+      CREATE TABLE IF NOT EXISTS author_insights (
+        author_id INTEGER PRIMARY KEY REFERENCES authors(id), summary TEXT NOT NULL,
+        evidence TEXT NOT NULL, generated_at TEXT NOT NULL, commit_count INTEGER NOT NULL
       );
     `);
   }
@@ -119,6 +125,30 @@ export class CommitStore {
       SUM(CASE WHEN datetime(c.committed_at) >= datetime('now', '-30 days') THEN 1 ELSE 0 END) AS last_30
       FROM authors a LEFT JOIN commits c ON c.author_id = a.id
       GROUP BY a.id ORDER BY last_30 DESC, a.name`).all() as Author[];
+  }
+
+  authorActivity(id: number): AuthorActivity {
+    const where = "(a.id = ? OR a.merged_into = ?) AND datetime(c.committed_at) >= datetime('now', '-30 days')";
+    const days = this.db.prepare(`SELECT date(c.committed_at, '+3 hours') AS day, COUNT(*) AS commits FROM commits c JOIN authors a ON a.id = c.author_id WHERE ${where} GROUP BY day ORDER BY day`).all(id, id) as { day: string; commits: number }[];
+    const repositories = this.db.prepare(`SELECT c.repository, COUNT(*) AS commits FROM commits c JOIN authors a ON a.id = c.author_id WHERE ${where} GROUP BY c.repository ORDER BY commits DESC, c.repository`).all(id, id) as { repository: string; commits: number }[];
+    const recent = this.db.prepare(`SELECT c.*, a.name AS author_name FROM commits c JOIN authors a ON a.id = c.author_id WHERE ${where} ORDER BY c.committed_at DESC LIMIT 500`).all(id, id) as CommitRow[];
+    return { activeDays: days.length, repositoryCount: repositories.length, days, repositories, recent };
+  }
+
+  authorInsight(id: number): AuthorInsight | undefined {
+    const row = this.db.prepare("SELECT summary, evidence, generated_at, commit_count FROM author_insights WHERE author_id = ?").get(id) as { summary: string; evidence: string; generated_at: string; commit_count: number } | undefined;
+    return row ? { ...row, evidence: JSON.parse(row.evidence) as string[] } : undefined;
+  }
+
+  authorCommitBySha(id: number, sha: string): CommitRow | undefined {
+    return this.db.prepare(`SELECT c.*, a.name AS author_name FROM commits c JOIN authors a ON a.id = c.author_id
+      WHERE c.sha = ? AND (a.id = ? OR a.merged_into = ?) LIMIT 1`).get(sha, id, id) as CommitRow | undefined;
+  }
+
+  saveAuthorInsight(id: number, summary: string, evidence: string[], commitCount: number): void {
+    this.db.prepare(`INSERT INTO author_insights(author_id, summary, evidence, generated_at, commit_count) VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), ?)
+      ON CONFLICT(author_id) DO UPDATE SET summary = excluded.summary, evidence = excluded.evidence, generated_at = excluded.generated_at, commit_count = excluded.commit_count`)
+      .run(id, summary, JSON.stringify(evidence), commitCount);
   }
 
   repositories(): Repository[] {

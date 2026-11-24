@@ -8,6 +8,7 @@ import { randomBytes, scryptSync } from "node:crypto";
 import { CommitStore } from "../dist/commit-store.js";
 import { handleAdmin } from "../dist/admin.js";
 import { runHistory } from "../dist/github-history.js";
+import { generateAuthorInsight } from "../dist/author-insight.js";
 
 test("commit storage deduplicates pushes, keeps authors and aggregates merged authors", () => {
   const folder = mkdtempSync(join(tmpdir(), "manager-bot-"));
@@ -90,6 +91,83 @@ test("history scans each branch and deduplicates shared commits", async () => {
     assert.equal(store.branches().filter((branch) => branch.status === "complete").length, 2);
     assert.equal(store.repositories()[0].status, "complete");
     assert.ok(paths.some((path) => path.includes(`sha=${sha}`)));
+  } finally {
+    globalThis.fetch = originalFetch;
+    rmSync(folder, { recursive: true, force: true });
+  }
+});
+
+test("dashboard ranks merged authors and profile counts active days and projects", async () => {
+  const folder = mkdtempSync(join(tmpdir(), "manager-ranking-"));
+  const store = new CommitStore(join(folder, "commits.sqlite"));
+  const config = { email: "admin@example.com", passwordHash: "unused:unused", sessionSecret: randomBytes(32).toString("hex") };
+  const server = createServer((request, response) => { void handleAdmin(request, response, store, config); });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const now = new Date().toISOString();
+    const insert = (sha, name, login, repository) => store.upsertCommit({ repository, sha: sha.repeat(40), message: `${name} change`, committedAt: now, authorName: name, authorLogin: login, url: `https://github.com/${repository}/commit/${sha}` });
+    insert("a", "Alice", "alice", "org/app");
+    insert("b", "Alice Work", "alice-work", "org/api");
+    insert("c", "Bob", "bob", "org/app");
+    insert("d", "Hidden Bot", "bot", "org/app");
+    const people = store.authors();
+    const alice = people.find((person) => person.github_login === "alice");
+    store.mergeAuthor(people.find((person) => person.github_login === "alice-work").id, alice.id);
+    store.setHidden(people.find((person) => person.github_login === "bot").id, true);
+    const activity = store.authorActivity(alice.id);
+    assert.equal(activity.activeDays, 1);
+    assert.equal(activity.repositoryCount, 2);
+    assert.equal(activity.recent.length, 2);
+    const cookie = `admin_session=${Date.now() + 100_000}.nonce`;
+    const { createHmac } = await import("node:crypto");
+    const signed = `${cookie}.${createHmac("sha256", config.sessionSecret).update(cookie.slice(14)).digest("hex")}`;
+    const base = `http://127.0.0.1:${server.address().port}`;
+    const home = await (await fetch(`${base}/admin`, { headers: { Cookie: signed } })).text();
+    assert.match(home, /Топ сотрудников/);
+    assert.match(home, /1 активный день/);
+    assert.ok(home.indexOf("Alice</strong>") < home.indexOf("Bob</strong>"));
+    assert.doesNotMatch(home, /Hidden Bot/);
+    const profile = await (await fetch(`${base}/admin/people/${alice.id}`, { headers: { Cookie: signed } })).text();
+    assert.match(profile, /Активных дней/);
+    assert.match(profile, /org\/api/);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    rmSync(folder, { recursive: true, force: true });
+  }
+});
+
+test("failed insight generation leaves the saved summary intact", async () => {
+  const folder = mkdtempSync(join(tmpdir(), "manager-insight-"));
+  const store = new CommitStore(join(folder, "commits.sqlite"));
+  const originalFetch = globalThis.fetch;
+  try {
+    store.upsertCommit({ repository: "org/app", sha: "e".repeat(40), message: "Fix auth", committedAt: new Date().toISOString(), authorName: "Alice", authorLogin: "alice", url: "https://github.com/org/app/commit/e" });
+    const id = store.authors()[0].id;
+    store.saveAuthorInsight(id, "Предыдущий итог", ["e".repeat(40)], 1);
+    globalThis.fetch = async () => new Response("failure", { status: 503 });
+    await assert.rejects(generateAuthorInsight("Alice", store.authorActivity(id), "key", "model"), /503/);
+    assert.equal(store.authorInsight(id).summary, "Предыдущий итог");
+  } finally {
+    globalThis.fetch = originalFetch;
+    rmSync(folder, { recursive: true, force: true });
+  }
+});
+
+test("insight accepts only evidence from supplied commits", async () => {
+  const folder = mkdtempSync(join(tmpdir(), "manager-insight-evidence-"));
+  const store = new CommitStore(join(folder, "commits.sqlite"));
+  const originalFetch = globalThis.fetch;
+  try {
+    const sha = "f".repeat(40);
+    store.upsertCommit({ repository: "org/app", sha, message: "Fix auth", committedAt: new Date().toISOString(), authorName: "Alice", authorLogin: "alice", url: "https://github.com/org/app/commit/f" });
+    globalThis.fetch = async (_url, options) => {
+      const request = JSON.parse(options.body);
+      assert.match(request.contents[0].parts[0].text, /Не оценивай эффективность/);
+      return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: JSON.stringify({ summary: "Исправляла авторизацию в org/app.", evidence: ["0".repeat(12), sha.slice(0, 12)] }) }] } }] }), { status: 200 });
+    };
+    const insight = await generateAuthorInsight("Alice", store.authorActivity(store.authors()[0].id), "key", "model");
+    assert.equal(insight.summary, "Исправляла авторизацию в org/app.");
+    assert.deepEqual(insight.evidence, [sha]);
   } finally {
     globalThis.fetch = originalFetch;
     rmSync(folder, { recursive: true, force: true });
