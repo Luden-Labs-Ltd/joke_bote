@@ -105,11 +105,13 @@ test("dashboard ranks merged authors and profile counts active days and projects
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   try {
     const now = new Date().toISOString();
-    const insert = (sha, name, login, repository) => store.upsertCommit({ repository, sha: sha.repeat(40), message: `${name} change`, committedAt: now, authorName: name, authorLogin: login, url: `https://github.com/${repository}/commit/${sha}` });
+    const insert = (sha, name, login, repository, message = `${name} change`) => store.upsertCommit({ repository, sha: sha.repeat(40), message, committedAt: now, authorName: name, authorLogin: login, url: `https://github.com/${repository}/commit/${sha}` });
     insert("a", "Alice", "alice", "org/app");
     insert("b", "Alice Work", "alice-work", "org/api");
-    insert("c", "Bob", "bob", "org/app");
+    insert("e", "Alice Work", "alice-work", "org/api", "Refactor auth\n\nUpdated token validation");
+    insert("c", "Bob", "bob", "org/other");
     insert("d", "Hidden Bot", "bot", "org/app");
+    store.setSummary("org/api", "b".repeat(40), "Изменена авторизация проекта.");
     const people = store.authors();
     const alice = people.find((person) => person.github_login === "alice");
     store.mergeAuthor(people.find((person) => person.github_login === "alice-work").id, alice.id);
@@ -117,7 +119,7 @@ test("dashboard ranks merged authors and profile counts active days and projects
     const activity = store.authorActivity(alice.id);
     assert.equal(activity.activeDays, 1);
     assert.equal(activity.repositoryCount, 2);
-    assert.equal(activity.recent.length, 2);
+    assert.equal(activity.recent.length, 3);
     const cookie = `admin_session=${Date.now() + 100_000}.nonce`;
     const { createHmac } = await import("node:crypto");
     const signed = `${cookie}.${createHmac("sha256", config.sessionSecret).update(cookie.slice(14)).digest("hex")}`;
@@ -130,6 +132,16 @@ test("dashboard ranks merged authors and profile counts active days and projects
     const profile = await (await fetch(`${base}/admin/people/${alice.id}`, { headers: { Cookie: signed } })).text();
     assert.match(profile, /Активных дней/);
     assert.match(profile, /org\/api/);
+    assert.match(profile, new RegExp(`/admin/commits\\?author=${alice.id}&amp;repository=org%2Fapi`));
+    const historyResponse = await fetch(`${base}/admin/commits?author=${alice.id}&repository=org%2Fapi`, { headers: { Cookie: signed } });
+    const history = await historyResponse.text();
+    assert.match(history, /Изменена авторизация проекта/);
+    assert.match(history, /Updated token validation/);
+    assert.match(history, /<option value="org\/api" selected>/);
+    assert.match(history, /<option value="org\/app"/);
+    assert.doesNotMatch(history, /<option value="org\/other"/);
+    assert.doesNotMatch(history, /Bob change/);
+    assert.match(historyResponse.headers.get("content-security-policy"), /script-src 'sha256-/);
   } finally {
     await new Promise((resolve) => server.close(resolve));
     rmSync(folder, { recursive: true, force: true });

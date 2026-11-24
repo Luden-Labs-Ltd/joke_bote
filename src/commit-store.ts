@@ -156,6 +156,12 @@ export class CommitStore {
       LEFT JOIN commits c ON c.repository = r.full_name GROUP BY r.full_name ORDER BY r.full_name`).all() as Repository[];
   }
 
+  repositoriesByAuthor(id: number): string[] {
+    return this.db.prepare(`SELECT DISTINCT c.repository FROM commits c JOIN authors a ON a.id = c.author_id
+      WHERE a.id = ? OR a.merged_into = ? ORDER BY c.repository`).all(id, id)
+      .map((row) => (row as { repository: string }).repository);
+  }
+
   branches(): { repository: string; branch: string; status: string; error: string | null }[] {
     return this.db.prepare("SELECT repository, branch, status, error FROM backfill ORDER BY repository, branch").all() as { repository: string; branch: string; status: string; error: string | null }[];
   }
