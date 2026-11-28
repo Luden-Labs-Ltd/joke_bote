@@ -88,6 +88,11 @@ export class CommitStore {
       for (const [name, description] of Object.entries(initialProjectDescriptions)) describe.run(description, name);
       this.db.prepare("INSERT INTO catalog_meta(key, value) VALUES ('initial_descriptions', 'done')").run();
     }
+    if (!this.db.prepare("SELECT 1 FROM catalog_meta WHERE key = 'initial_descriptions_v2'").get()) {
+      const describe = this.db.prepare("UPDATE projects SET description = ? WHERE name = ? AND description = '' AND draft = ''");
+      for (const name of ["ship", "Enola"]) describe.run(initialProjectDescriptions[name], name);
+      this.db.prepare("INSERT INTO catalog_meta(key, value) VALUES ('initial_descriptions_v2', 'done')").run();
+    }
     if (!this.db.prepare("SELECT 1 FROM catalog_meta WHERE key = 'initial_mapping'").get()) {
       for (const repo of this.repositories()) this.assignInitialProject(repo.full_name);
       this.db.prepare("INSERT INTO catalog_meta(key, value) VALUES ('initial_mapping', 'done')").run();

@@ -61,9 +61,12 @@ test("product catalog groups repositories, keeps tracker-only projects and publi
     store.assignRepository("org/unmatched", null);
     assert.deepEqual(store.unassignedRepositories(), ["org/unmatched"]);
     store.assignRepository("org/voice-api", null);
+    const ship = store.projects("2026-11").find((project) => project.name === "ship");
+    store.updateProject(ship.id, ship.name, "", ship.tracker_url);
     const reopened = new CommitStore(path);
     assert.equal(reopened.projects("2026-11").find((project) => project.id === voice.id).description, "Черновик о продукте");
     assert.ok(reopened.unassignedRepositories().includes("org/voice-api"));
+    assert.equal(reopened.projects("2026-11").find((project) => project.id === ship.id).description, "");
   } finally { rmSync(folder, { recursive: true, force: true }); }
 });
 
