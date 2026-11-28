@@ -53,9 +53,12 @@ export async function runHistory(store: CommitStore, token: string, organization
   for (const repository of existing) {
     try {
       const [owner, repo] = repository.split("/");
+      let branchCount = 0;
       for await (const branch of paginate<GitHubBranch>(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/branches`, token)) {
         store.addBranch(repository, branch.name, branch.commit.sha);
+        branchCount += 1;
       }
+      if (branchCount === 0) store.markEmptyRepository(repository);
     } catch (error) {
       store.setRepositoryError(repository, String(error));
       continue;
@@ -69,7 +72,12 @@ export async function runHistory(store: CommitStore, token: string, organization
       while (true) {
         const params = new URLSearchParams({ sha: branch.head_sha, per_page: "100", page: String(page) });
         const commits = await githubGet<GitHubCommit[]>(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/commits?${params}`, token);
+        let reachedPreviousHead = false;
         for (const commit of commits) {
+          if (branch.incremental && commit.sha === branch.previous_head_sha) {
+            reachedPreviousHead = true;
+            break;
+          }
           const author = commit.commit.author;
           store.upsertCommit({
             repository: branch.repository,
@@ -83,8 +91,8 @@ export async function runHistory(store: CommitStore, token: string, organization
           });
         }
         page += 1;
-        store.setBranch(branch.repository, branch.branch, page, commits.length < 100 ? "complete" : "loading");
-        if (commits.length < 100) break;
+        store.setBranch(branch.repository, branch.branch, page, reachedPreviousHead || commits.length < 100 ? "complete" : "loading");
+        if (reachedPreviousHead || commits.length < 100) break;
         await new Promise((resolve) => setTimeout(resolve, 250));
       }
     } catch (error) {

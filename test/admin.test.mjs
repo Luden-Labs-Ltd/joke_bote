@@ -157,6 +157,58 @@ test("history scans each branch and deduplicates shared commits", async () => {
   }
 });
 
+test("history reconciles a changed branch even when the newest webhook commit is already stored", async () => {
+  const folder = mkdtempSync(join(tmpdir(), "manager-reconcile-"));
+  const store = new CommitStore(join(folder, "commits.sqlite"));
+  const originalFetch = globalThis.fetch;
+  const oldSha = "1".repeat(40), missedSha = "2".repeat(40), headSha = "3".repeat(40);
+  let currentHead = oldSha;
+  const requested = [];
+  const commit = (sha) => ({ sha, html_url: `https://github.com/org/app/commit/${sha}`, author: { login: "alice" }, commit: { message: sha, author: { name: "Alice", email: "alice@example.com", date: "2026-11-01T12:00:00Z" }, committer: { date: "2026-11-01T12:00:00Z" } } });
+  globalThis.fetch = async (input) => {
+    const url = new URL(input);
+    if (url.pathname === "/orgs/org/repos") return Response.json([{ full_name: "org/app" }]);
+    if (url.pathname.endsWith("/branches")) return Response.json([{ name: "main", commit: { sha: currentHead } }]);
+    if (url.pathname.endsWith("/commits")) {
+      requested.push(url.searchParams.get("sha"));
+      return Response.json(currentHead === oldSha ? [commit(oldSha)] : [commit(headSha), commit(missedSha), commit(oldSha)]);
+    }
+    throw new Error(`Unexpected URL ${url}`);
+  };
+  try {
+    await runHistory(store, "token", "org");
+    assert.equal(store.commits({}).length, 1);
+    currentHead = headSha;
+    store.upsertCommit({ repository: "org/app", sha: headSha, message: "webhook", committedAt: "2026-11-03T12:00:00Z", authorName: "Alice", authorLogin: "alice", url: `https://github.com/org/app/commit/${headSha}` });
+    await runHistory(store, "token", "org");
+    assert.equal(store.commits({}).length, 3);
+    assert.equal(store.branches()[0].status, "complete");
+    assert.deepEqual(requested, [oldSha, headSha]);
+    await runHistory(store, "token", "org");
+    assert.deepEqual(requested, [oldSha, headSha]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    rmSync(folder, { recursive: true, force: true });
+  }
+});
+
+test("empty repositories finish discovery without a permanent loading notice", async () => {
+  const folder = mkdtempSync(join(tmpdir(), "manager-empty-repo-"));
+  const store = new CommitStore(join(folder, "commits.sqlite"));
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = new URL(input);
+    if (url.pathname === "/orgs/org/repos") return Response.json([{ full_name: "org/empty" }]);
+    if (url.pathname === "/repos/org/empty/branches") return Response.json([]);
+    throw new Error(`Unexpected URL ${url}`);
+  };
+  try {
+    await runHistory(store, "token", "org");
+    assert.equal(store.repositories().find((repo) => repo.full_name === "org/empty").status, "complete");
+    assert.deepEqual(store.branches(), []);
+  } finally { globalThis.fetch = originalFetch; rmSync(folder, { recursive: true, force: true }); }
+});
+
 test("dashboard ranks merged authors and profile counts active days and projects", async () => {
   const folder = mkdtempSync(join(tmpdir(), "manager-ranking-"));
   const store = new CommitStore(join(folder, "commits.sqlite"));

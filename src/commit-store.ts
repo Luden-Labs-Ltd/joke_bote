@@ -56,7 +56,7 @@ export class CommitStore {
       CREATE TABLE IF NOT EXISTS backfill (
         repository TEXT NOT NULL REFERENCES repositories(full_name), branch TEXT NOT NULL,
         head_sha TEXT NOT NULL, page INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'pending',
-        error TEXT, PRIMARY KEY(repository, branch)
+        error TEXT, incremental INTEGER NOT NULL DEFAULT 0, previous_head_sha TEXT, PRIMARY KEY(repository, branch)
       );
       CREATE TABLE IF NOT EXISTS author_insights (
         author_id INTEGER PRIMARY KEY REFERENCES authors(id), summary TEXT NOT NULL,
@@ -81,6 +81,12 @@ export class CommitStore {
       );
       CREATE TABLE IF NOT EXISTS catalog_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     `);
+    if (!(this.db.pragma("table_info(backfill)") as { name: string }[]).some((column) => column.name === "incremental")) {
+      this.db.exec("ALTER TABLE backfill ADD COLUMN incremental INTEGER NOT NULL DEFAULT 0");
+    }
+    if (!(this.db.pragma("table_info(backfill)") as { name: string }[]).some((column) => column.name === "previous_head_sha")) {
+      this.db.exec("ALTER TABLE backfill ADD COLUMN previous_head_sha TEXT");
+    }
     const seed = this.db.prepare("INSERT OR IGNORE INTO projects(name, tracker_url) VALUES (?, ?)");
     for (const [name, trackerId] of projectSeeds) seed.run(name, `https://tracker.luden-labs.com/project/projects/${trackerId}/issues/`);
     if (!this.db.prepare("SELECT 1 FROM catalog_meta WHERE key = 'initial_descriptions'").get()) {
@@ -157,11 +163,26 @@ export class CommitStore {
 
   addBranch(repository: string, branch: string, headSha: string): void {
     this.addRepository(repository);
-    this.db.prepare("INSERT OR IGNORE INTO backfill(repository, branch, head_sha) VALUES (?, ?, ?)").run(repository, branch, headSha);
+    const existing = this.db.prepare("SELECT head_sha, status FROM backfill WHERE repository = ? AND branch = ?")
+      .get(repository, branch) as { head_sha: string; status: string } | undefined;
+    if (!existing) {
+      this.db.prepare("INSERT INTO backfill(repository, branch, head_sha) VALUES (?, ?, ?)").run(repository, branch, headSha);
+      this.db.prepare("UPDATE repositories SET status = 'loading', error = NULL WHERE full_name = ?").run(repository);
+      return;
+    }
+    if (existing.head_sha === headSha) return;
+    this.db.prepare("UPDATE backfill SET head_sha = ?, page = 1, status = 'pending', error = NULL, incremental = ?, previous_head_sha = ? WHERE repository = ? AND branch = ?")
+      .run(headSha, existing.status === "complete" ? 1 : 0, existing.status === "complete" ? existing.head_sha : null, repository, branch);
+    this.db.prepare("UPDATE repositories SET status = 'loading', error = NULL WHERE full_name = ?").run(repository);
   }
 
-  pendingBranches(): { repository: string; branch: string; head_sha: string; page: number }[] {
-    return this.db.prepare("SELECT repository, branch, head_sha, page FROM backfill WHERE status != 'complete' ORDER BY repository, branch").all() as { repository: string; branch: string; head_sha: string; page: number }[];
+  pendingBranches(): { repository: string; branch: string; head_sha: string; page: number; incremental: number; previous_head_sha: string | null }[] {
+    return this.db.prepare("SELECT repository, branch, head_sha, page, incremental, previous_head_sha FROM backfill WHERE status != 'complete' ORDER BY repository, branch").all() as { repository: string; branch: string; head_sha: string; page: number; incremental: number; previous_head_sha: string | null }[];
+  }
+
+  markEmptyRepository(repository: string): void {
+    this.db.prepare("UPDATE repositories SET status = 'complete', error = NULL, updated_at = datetime('now') WHERE full_name = ? AND NOT EXISTS (SELECT 1 FROM backfill WHERE repository = ?)")
+      .run(repository, repository);
   }
 
   setBranch(repository: string, branch: string, page: number, status: string, error: string | null = null): void {
