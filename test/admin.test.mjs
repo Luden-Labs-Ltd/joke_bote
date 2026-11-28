@@ -9,6 +9,30 @@ import { CommitStore } from "../dist/commit-store.js";
 import { handleAdmin } from "../dist/admin.js";
 import { runHistory } from "../dist/github-history.js";
 import { generateAuthorInsight } from "../dist/author-insight.js";
+import { monthDays, nextMonth } from "../dist/month.js";
+
+test("calendar months include their own first and last days in Minsk", () => {
+  const folder = mkdtempSync(join(tmpdir(), "manager-month-"));
+  try {
+    const store = new CommitStore(join(folder, "commits.sqlite"));
+    const insert = (sha, date) => store.upsertCommit({ repository: "org/app", sha: sha.repeat(40), message: sha, committedAt: date, authorName: "Alice", authorLogin: "alice", url: `https://github.com/org/app/commit/${sha}` });
+    insert("a", "2026-10-31T20:59:59Z");
+    insert("b", "2026-10-31T21:00:00Z");
+    insert("c", "2026-11-30T20:59:59Z");
+    insert("d", "2026-11-30T21:00:00Z");
+    const id = store.authors("2026-11")[0].id;
+    assert.equal(store.authors("2026-11")[0].month_commits, 2);
+    assert.deepEqual(store.authorActivity(id, "2026-11").days.map((row) => row.day), ["2026-11-01", "2026-11-30"]);
+    assert.equal(store.trend("2026-11").reduce((sum, row) => sum + row.commits, 0), 2);
+    assert.equal(store.authors("2026-10")[0].month_commits, 1);
+    assert.equal(store.authors("2026-12")[0].month_commits, 1);
+    assert.equal(monthDays("2024-02").length, 29);
+    assert.equal(nextMonth("2026-12"), "2027-01");
+    store.saveAuthorInsight(id, "2026-11", "November", ["b".repeat(40)], 2);
+    assert.equal(store.authorInsight(id, "2026-11")?.summary, "November");
+    assert.equal(store.authorInsight(id, "2026-10"), undefined);
+  } finally { rmSync(folder, { recursive: true, force: true }); }
+});
 
 test("commit storage deduplicates pushes, keeps authors and aggregates merged authors", () => {
   const folder = mkdtempSync(join(tmpdir(), "manager-bot-"));
@@ -25,7 +49,7 @@ test("commit storage deduplicates pushes, keeps authors and aggregates merged au
     store.mergeAuthor(authors[1].id, authors[0].id);
     assert.equal(store.commits({ author: authors[0].id }).length, 2);
     store.setHidden(authors[0].id, true);
-    assert.equal(store.trend(30).reduce((sum, row) => sum + row.commits, 0), 0);
+    assert.equal(store.trend(new Date(Date.now() + 3 * 3600_000).toISOString().slice(0, 7)).reduce((sum, row) => sum + row.commits, 0), 0);
     store.unmergeAuthor(authors[1].id);
     assert.equal(store.authors().find((author) => author.id === authors[1].id).merged_into, null);
     store.upsertCommit({ ...first, sha: "f".repeat(40), authorName: "Alice Home", authorLogin: "alice-home" });
@@ -135,7 +159,7 @@ test("dashboard ranks merged authors and profile counts active days and projects
     const profile = await (await fetch(`${base}/admin/people/${alice.id}`, { headers: { Cookie: signed } })).text();
     assert.match(profile, /Активных дней/);
     assert.match(profile, /org\/api/);
-    assert.match(profile, /Все активные дни за 30 дней/);
+    assert.match(profile, /Все активные дни ·/);
     assert.match(profile, new RegExp(`/admin/commits\\?author=${alice.id}&amp;from=\\d{4}-\\d{2}-\\d{2}&amp;to=\\d{4}-\\d{2}-\\d{2}`));
     assert.match(profile, /3 файла · <span>\+42<\/span> \/ <span>−7<\/span> строк/);
     assert.match(profile, /Updated token validation/);
@@ -163,7 +187,7 @@ test("failed insight generation leaves the saved summary intact", async () => {
   try {
     store.upsertCommit({ repository: "org/app", sha: "e".repeat(40), message: "Fix auth", committedAt: new Date().toISOString(), authorName: "Alice", authorLogin: "alice", url: "https://github.com/org/app/commit/e" });
     const id = store.authors()[0].id;
-    store.saveAuthorInsight(id, "Предыдущий итог", ["e".repeat(40)], 1);
+    store.saveAuthorInsight(id, new Date(Date.now() + 3 * 3600_000).toISOString().slice(0, 7), "Предыдущий итог", ["e".repeat(40)], 1);
     globalThis.fetch = async () => new Response("failure", { status: 503 });
     await assert.rejects(generateAuthorInsight("Alice", store.authorActivity(id), "key", "model"), /503/);
     assert.equal(store.authorInsight(id).summary, "Предыдущий итог");

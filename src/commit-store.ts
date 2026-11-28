@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { currentMonth, nextMonth } from "./month.js";
 
 export type CommitInput = {
   repository: string;
@@ -14,7 +15,7 @@ export type CommitInput = {
   summary?: string | null;
 };
 
-export type Author = { id: number; name: string; github_login: string | null; hidden: number; merged_into: number | null; commits: number; last_commit: string | null; last_7: number; last_30: number };
+export type Author = { id: number; name: string; github_login: string | null; hidden: number; merged_into: number | null; commits: number; last_commit: string | null; month_commits: number };
 export type CommitRow = { repository: string; sha: string; message: string; committed_at: string; url: string; summary: string | null; author_id: number; author_name: string; additions: number | null; deletions: number | null; changed_files: number | null };
 export type Repository = { full_name: string; status: string; error: string | null; updated_at: string | null; commit_count: number };
 export type AuthorActivity = { activeDays: number; repositoryCount: number; days: { day: string; commits: number }[]; repositories: { repository: string; commits: number }[]; recent: CommitRow[] };
@@ -58,6 +59,11 @@ export class CommitStore {
       CREATE TABLE IF NOT EXISTS author_insights (
         author_id INTEGER PRIMARY KEY REFERENCES authors(id), summary TEXT NOT NULL,
         evidence TEXT NOT NULL, generated_at TEXT NOT NULL, commit_count INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS monthly_author_insights (
+        author_id INTEGER NOT NULL REFERENCES authors(id), month TEXT NOT NULL, summary TEXT NOT NULL,
+        evidence TEXT NOT NULL, generated_at TEXT NOT NULL, commit_count INTEGER NOT NULL,
+        PRIMARY KEY(author_id, month)
       );
       CREATE TABLE IF NOT EXISTS commit_stats (
         repository TEXT NOT NULL, sha TEXT NOT NULL, additions INTEGER, deletions INTEGER,
@@ -131,13 +137,13 @@ export class CommitStore {
       .run(repository, sha, stats?.additions ?? null, stats?.deletions ?? null, stats?.changedFiles ?? null);
   }
 
-  recentCommitsNeedingStats(id: number, limit = 10): { repository: string; sha: string }[] {
+  recentCommitsNeedingStats(id: number, month = currentMonth(), limit = 10): { repository: string; sha: string }[] {
     return this.db.prepare(`SELECT recent.repository, recent.sha FROM (SELECT c.repository, c.sha FROM commits c JOIN authors a ON a.id = c.author_id
-      WHERE (a.id = ? OR a.merged_into = ?) AND datetime(c.committed_at) >= datetime('now', '-30 days')
+      WHERE (a.id = ? OR a.merged_into = ?) AND date(c.committed_at, '+3 hours') >= ? AND date(c.committed_at, '+3 hours') < ?
       ORDER BY c.committed_at DESC LIMIT ?) recent
       LEFT JOIN commit_stats s ON s.repository = recent.repository AND s.sha = recent.sha
       WHERE s.checked_at IS NULL OR (s.additions IS NULL AND datetime(s.checked_at) < datetime('now', '-1 hour'))`)
-      .all(id, id, limit) as { repository: string; sha: string }[];
+      .all(id, id, `${month}-01`, `${nextMonth(month)}-01`, limit) as { repository: string; sha: string }[];
   }
 
   commitsNeedingStats(commits: CommitRow[]): { repository: string; sha: string }[] {
@@ -149,25 +155,26 @@ export class CommitStore {
     }).map(({ repository, sha }) => ({ repository, sha }));
   }
 
-  authors(): Author[] {
+  authors(month = currentMonth()): Author[] {
+    const next = nextMonth(month);
     return this.db.prepare(`SELECT a.id, a.name, a.github_login, a.hidden, a.merged_into,
       COUNT(c.sha) AS commits, MAX(c.committed_at) AS last_commit,
-      SUM(CASE WHEN datetime(c.committed_at) >= datetime('now', '-7 days') THEN 1 ELSE 0 END) AS last_7,
-      SUM(CASE WHEN datetime(c.committed_at) >= datetime('now', '-30 days') THEN 1 ELSE 0 END) AS last_30
+      SUM(CASE WHEN date(c.committed_at, '+3 hours') >= ? AND date(c.committed_at, '+3 hours') < ? THEN 1 ELSE 0 END) AS month_commits
       FROM authors a LEFT JOIN commits c ON c.author_id = a.id
-      GROUP BY a.id ORDER BY last_30 DESC, a.name`).all() as Author[];
+      GROUP BY a.id ORDER BY month_commits DESC, a.name`).all(`${month}-01`, `${next}-01`) as Author[];
   }
 
-  authorActivity(id: number): AuthorActivity {
-    const where = "(a.id = ? OR a.merged_into = ?) AND datetime(c.committed_at) >= datetime('now', '-30 days')";
-    const days = this.db.prepare(`SELECT date(c.committed_at, '+3 hours') AS day, COUNT(*) AS commits FROM commits c JOIN authors a ON a.id = c.author_id WHERE ${where} GROUP BY day ORDER BY day`).all(id, id) as { day: string; commits: number }[];
-    const repositories = this.db.prepare(`SELECT c.repository, COUNT(*) AS commits FROM commits c JOIN authors a ON a.id = c.author_id WHERE ${where} GROUP BY c.repository ORDER BY commits DESC, c.repository`).all(id, id) as { repository: string; commits: number }[];
-    const recent = this.db.prepare(`SELECT c.*, a.name AS author_name, s.additions, s.deletions, s.changed_files FROM commits c JOIN authors a ON a.id = c.author_id LEFT JOIN commit_stats s ON s.repository = c.repository AND s.sha = c.sha WHERE ${where} ORDER BY c.committed_at DESC LIMIT 500`).all(id, id) as CommitRow[];
+  authorActivity(id: number, month = currentMonth()): AuthorActivity {
+    const where = "(a.id = ? OR a.merged_into = ?) AND date(c.committed_at, '+3 hours') >= ? AND date(c.committed_at, '+3 hours') < ?";
+    const args = [id, id, `${month}-01`, `${nextMonth(month)}-01`];
+    const days = this.db.prepare(`SELECT date(c.committed_at, '+3 hours') AS day, COUNT(*) AS commits FROM commits c JOIN authors a ON a.id = c.author_id WHERE ${where} GROUP BY day ORDER BY day`).all(...args) as { day: string; commits: number }[];
+    const repositories = this.db.prepare(`SELECT c.repository, COUNT(*) AS commits FROM commits c JOIN authors a ON a.id = c.author_id WHERE ${where} GROUP BY c.repository ORDER BY commits DESC, c.repository`).all(...args) as { repository: string; commits: number }[];
+    const recent = this.db.prepare(`SELECT c.*, a.name AS author_name, s.additions, s.deletions, s.changed_files FROM commits c JOIN authors a ON a.id = c.author_id LEFT JOIN commit_stats s ON s.repository = c.repository AND s.sha = c.sha WHERE ${where} ORDER BY c.committed_at DESC LIMIT 500`).all(...args) as CommitRow[];
     return { activeDays: days.length, repositoryCount: repositories.length, days, repositories, recent };
   }
 
-  authorInsight(id: number): AuthorInsight | undefined {
-    const row = this.db.prepare("SELECT summary, evidence, generated_at, commit_count FROM author_insights WHERE author_id = ?").get(id) as { summary: string; evidence: string; generated_at: string; commit_count: number } | undefined;
+  authorInsight(id: number, month = currentMonth()): AuthorInsight | undefined {
+    const row = this.db.prepare("SELECT summary, evidence, generated_at, commit_count FROM monthly_author_insights WHERE author_id = ? AND month = ?").get(id, month) as { summary: string; evidence: string; generated_at: string; commit_count: number } | undefined;
     return row ? { ...row, evidence: JSON.parse(row.evidence) as string[] } : undefined;
   }
 
@@ -176,10 +183,10 @@ export class CommitStore {
       WHERE c.sha = ? AND (a.id = ? OR a.merged_into = ?) LIMIT 1`).get(sha, id, id) as CommitRow | undefined;
   }
 
-  saveAuthorInsight(id: number, summary: string, evidence: string[], commitCount: number): void {
-    this.db.prepare(`INSERT INTO author_insights(author_id, summary, evidence, generated_at, commit_count) VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), ?)
-      ON CONFLICT(author_id) DO UPDATE SET summary = excluded.summary, evidence = excluded.evidence, generated_at = excluded.generated_at, commit_count = excluded.commit_count`)
-      .run(id, summary, JSON.stringify(evidence), commitCount);
+  saveAuthorInsight(id: number, month: string, summary: string, evidence: string[], commitCount: number): void {
+    this.db.prepare(`INSERT INTO monthly_author_insights(author_id, month, summary, evidence, generated_at, commit_count) VALUES (?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), ?)
+      ON CONFLICT(author_id, month) DO UPDATE SET summary = excluded.summary, evidence = excluded.evidence, generated_at = excluded.generated_at, commit_count = excluded.commit_count`)
+      .run(id, month, summary, JSON.stringify(evidence), commitCount);
   }
 
   repositories(): Repository[] {
@@ -209,11 +216,11 @@ export class CommitStore {
       ORDER BY c.committed_at DESC LIMIT 50 OFFSET ?`).all(...values, Math.max(0, (filters.page ?? 1) - 1) * 50) as CommitRow[];
   }
 
-  trend(days: number): { day: string; commits: number }[] {
+  trend(month: string): { day: string; commits: number }[] {
     return this.db.prepare(`SELECT date(c.committed_at, '+3 hours') AS day, COUNT(*) AS commits FROM commits c
       JOIN authors a ON a.id = c.author_id LEFT JOIN authors root ON root.id = a.merged_into
-      WHERE datetime(c.committed_at) >= datetime('now', ?) AND COALESCE(root.hidden, a.hidden) = 0
-      GROUP BY day ORDER BY day`).all(`-${days} days`) as { day: string; commits: number }[];
+      WHERE date(c.committed_at, '+3 hours') >= ? AND date(c.committed_at, '+3 hours') < ? AND COALESCE(root.hidden, a.hidden) = 0
+      GROUP BY day ORDER BY day`).all(`${month}-01`, `${nextMonth(month)}-01`) as { day: string; commits: number }[];
   }
 
   weekdays(): { weekday: number; commits: number }[] {

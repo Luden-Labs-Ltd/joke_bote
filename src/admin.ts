@@ -2,6 +2,7 @@ import { createHash, createHmac, randomBytes, scryptSync, timingSafeEqual } from
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Author, CommitRow, CommitStore } from "./commit-store.js";
 import { generateAuthorInsight } from "./author-insight.js";
+import { currentMonth, monthDays, monthLabel, selectedMonth } from "./month.js";
 
 type AdminConfig = { email: string; passwordHash: string; sessionSecret: string; geminiApiKey?: string; geminiModel?: string; githubApiToken?: string };
 const failedLogins = new Map<string, { attempts: number; until: number }>();
@@ -63,22 +64,25 @@ export async function handleAdmin(request: IncomingMessage, response: ServerResp
   }
 
   const csrf = sign(session, config.sessionSecret);
+  const month = selectedMonth(url.searchParams.get("month"));
+  const label = monthLabel(month);
   if (request.method === "POST") {
     const form = await readForm(request);
     if (!validCsrf(form, session, config.sessionSecret)) { response.writeHead(403).end(); return true; }
     const id = Number(form.get("id"));
+    const postMonth = selectedMonth(form.get("month"));
     try {
       if (url.pathname === "/admin/insight" && Number.isSafeInteger(id) && id > 0) {
-        const author = combinedAuthors(store.authors()).find((person) => person.id === id);
+        const author = combinedAuthors(store.authors(postMonth)).find((person) => person.id === id);
         if (!author) { response.writeHead(404).end(); return true; }
-        if (!config.geminiApiKey) { redirect(response, `/admin/people/${id}?insight_error=unavailable`); return true; }
+        if (!config.geminiApiKey) { redirect(response, `/admin/people/${id}?month=${postMonth}&insight_error=unavailable`); return true; }
         try {
-          const insight = await generateAuthorInsight(author.name, store.authorActivity(id), config.geminiApiKey, config.geminiModel || "gemini-2.5-flash");
-          store.saveAuthorInsight(id, insight.summary, insight.evidence, author.last_30);
-          redirect(response, `/admin/people/${id}`);
+          const insight = await generateAuthorInsight(author.name, store.authorActivity(id, postMonth), config.geminiApiKey, config.geminiModel || "gemini-2.5-flash", monthLabel(postMonth));
+          store.saveAuthorInsight(id, postMonth, insight.summary, insight.evidence, author.month_commits);
+          redirect(response, `/admin/people/${id}?month=${postMonth}`);
         } catch (error) {
           console.error("Author insight failed", { authorId: id, error });
-          redirect(response, `/admin/people/${id}?insight_error=failed`);
+          redirect(response, `/admin/people/${id}?month=${postMonth}&insight_error=failed`);
         }
         return true;
       }
@@ -94,23 +98,19 @@ export async function handleAdmin(request: IncomingMessage, response: ServerResp
   }
 
   if (url.pathname === "/admin" || url.pathname === "/admin/") {
-    const authors = combinedAuthors(store.authors());
+    const authors = combinedAuthors(store.authors(month));
     const repositories = store.repositories();
-    const total7 = authors.reduce((sum, author) => sum + author.last_7, 0);
-    const total30 = authors.reduce((sum, author) => sum + author.last_30, 0);
-    const recorded = new Map(store.trend(30).map((row) => [row.day, row.commits]));
-    const trend = Array.from({ length: 30 }, (_, index) => {
-      const day = new Date(Date.now() + 3 * 60 * 60 * 1000 - (29 - index) * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-      return { day, commits: recorded.get(day) ?? 0 };
-    });
+    const totalMonth = authors.reduce((sum, author) => sum + author.month_commits, 0);
+    const recorded = new Map(store.trend(month).map((row) => [row.day, row.commits]));
+    const trend = monthDays(month).map((day) => ({ day, commits: recorded.get(day) ?? 0 }));
     const max = Math.max(1, ...trend.map((row) => row.commits));
-    const top = authors.filter((author) => author.last_30 > 0).slice(0, 5).map((author, index) => ({ ...author, rank: index + 1, activity: store.authorActivity(author.id) }));
+    const top = authors.filter((author) => author.month_commits > 0).slice(0, 5).map((author, index) => ({ ...author, rank: index + 1, activity: store.authorActivity(author.id, month) }));
     const loading = repositories.some((repo) => repo.status !== "complete");
-    const content = `<div class="page-title"><div><h1>Команда за 30 дней</h1><p class="muted">Коммиты показывают активность, а не качество работы.</p></div><a href="/admin/people">Все сотрудники →</a></div>
+    const content = `<form class="month-picker" method="get"><label for="month">Месяц</label><input id="month" name="month" type="month" min="2020-01" max="${currentMonth()}" value="${month}"><button>Показать</button></form><div class="page-title"><div><h1>Команда за ${escapeHtml(label)}</h1><p class="muted">Коммиты показывают активность, а не качество работы.</p></div><a href="/admin/people?month=${month}">Все сотрудники →</a></div>
       ${loading ? '<p class="notice">История репозиториев ещё загружается. Цифры могут увеличиться.</p>' : ""}
-      <div class="cards"><article><span>Коммитов за 30 дней</span><strong>${total30}</strong></article><article><span>За 7 дней</span><strong>${total7}</strong></article><article><span>Сотрудников</span><strong>${authors.length}</strong></article><article><span>Репозиториев</span><strong>${repositories.length}</strong></article></div>
-      <section><div class="section-heading"><h2>Топ сотрудников · 30 дней</h2><small>По числу коммитов</small></div>${top.length ? top.map((person) => `<a class="leader-row" href="/admin/people/${person.id}"><span class="rank">${person.rank}</span><span class="leader-name"><strong>${escapeHtml(person.name)}</strong><small>${person.activity.activeDays} ${plural(person.activity.activeDays, "активный день", "активных дня", "активных дней")} · ${person.activity.repositoryCount} ${plural(person.activity.repositoryCount, "проект", "проекта", "проектов")}</small></span><strong class="leader-count">${person.last_30}</strong><span class="leader-label">коммитов</span></a>`).join("") : '<p class="muted">За последние 30 дней коммитов пока нет.</p>'}<a class="section-link" href="/admin/people">Посмотреть всех сотрудников →</a></section>
-      <section><h2>Динамика коммитов · 30 дней</h2><div class="chart">${trend.map((row, index) => `<div class="bar-wrap" title="${escapeHtml(row.day)}: ${row.commits}"><div class="bar" style="height:${row.commits ? Math.max(4, row.commits / max * 100) : 0}%"></div><small>${index % 5 === 0 || index === 29 ? escapeHtml(row.day.slice(5)) : ""}</small></div>`).join("")}</div></section>`;
+      <div class="cards"><article><span>Коммитов · ${escapeHtml(label)}</span><strong>${totalMonth}</strong></article><article><span>Активных сотрудников</span><strong>${authors.filter((author) => author.month_commits > 0).length}</strong></article><article><span>Сотрудников</span><strong>${authors.length}</strong></article><article><span>Репозиториев</span><strong>${repositories.length}</strong></article></div>
+      <section><div class="section-heading"><h2>Топ сотрудников · ${escapeHtml(label)}</h2><small>По числу коммитов</small></div>${top.length ? top.map((person) => `<a class="leader-row" href="/admin/people/${person.id}?month=${month}"><span class="rank">${person.rank}</span><span class="leader-name"><strong>${escapeHtml(person.name)}</strong><small>${person.activity.activeDays} ${plural(person.activity.activeDays, "активный день", "активных дня", "активных дней")} · ${person.activity.repositoryCount} ${plural(person.activity.repositoryCount, "проект", "проекта", "проектов")}</small></span><strong class="leader-count">${person.month_commits}</strong><span class="leader-label">коммитов</span></a>`).join("") : '<p class="muted">За ${escapeHtml(label)} коммитов пока нет.</p>'}<a class="section-link" href="/admin/people?month=${month}">Посмотреть всех сотрудников →</a></section>
+      <section><h2>Динамика коммитов · ${escapeHtml(label)}</h2><div class="chart">${trend.map((row, index) => `<div class="bar-wrap" title="${escapeHtml(row.day)}: ${row.commits}"><div class="bar" style="height:${row.commits ? Math.max(4, row.commits / max * 100) : 0}%"></div><small>${index % 5 === 0 || index === trend.length - 1 ? escapeHtml(row.day.slice(5)) : ""}</small></div>`).join("")}</div></section>`;
     sendHtml(response, page("Обзор", content, true, csrf));
     return true;
   }
@@ -118,43 +118,39 @@ export async function handleAdmin(request: IncomingMessage, response: ServerResp
   const profile = url.pathname.match(/^\/admin\/people\/(\d+)$/);
   if (profile) {
     const id = Number(profile[1]);
-    const author = combinedAuthors(store.authors()).find((person) => person.id === id);
+    const author = combinedAuthors(store.authors(month)).find((person) => person.id === id);
     if (!author) { response.writeHead(404).end(); return true; }
-    if (config.githubApiToken) await loadCommitStats(store, store.recentCommitsNeedingStats(id), config.githubApiToken);
-    const activity = store.authorActivity(id);
-    const insight = store.authorInsight(id);
+    if (config.githubApiToken) await loadCommitStats(store, store.recentCommitsNeedingStats(id, month), config.githubApiToken);
+    const activity = store.authorActivity(id, month);
+    const insight = store.authorInsight(id, month);
     const evidence = (insight?.evidence ?? []).map((sha) => store.authorCommitBySha(id, sha)).filter((commit) => commit !== undefined);
     const days = new Map(activity.days.map((row) => [row.day, row.commits]));
-    const recentDays = Array.from({ length: 7 }, (_, index) => {
-      const day = new Date(Date.now() + 3 * 60 * 60 * 1000 - (6 - index) * 86_400_000).toISOString().slice(0, 10);
-      return { day, commits: days.get(day) ?? 0 };
-    });
-    const recent7Total = recentDays.reduce((total, row) => total + row.commits, 0);
+    const recentDays = monthDays(month).map((day) => ({ day, commits: days.get(day) ?? 0 }));
     const max = Math.max(1, ...recentDays.map((row) => row.commits));
     const loading = store.repositories().some((repo) => repo.status !== "complete");
-    const content = `<a class="back-link" href="/admin/people">← Все сотрудники</a><h1>${escapeHtml(author.name)}</h1><p class="muted">Активный день = день с хотя бы одним коммитом.</p>
+    const content = `<a class="back-link" href="/admin/people?month=${month}">← Все сотрудники</a><form class="month-picker" method="get"><label for="month">Месяц</label><input id="month" name="month" type="month" min="2020-01" max="${currentMonth()}" value="${month}"><button>Показать</button></form><h1>${escapeHtml(author.name)}</h1><p class="muted">Активный день = день с хотя бы одним коммитом.</p>
       ${loading ? '<p class="notice">История ещё загружается. Цифры могут увеличиться.</p>' : ""}
-      <div class="cards profile-cards"><article><span>Коммитов за 30 дней</span><strong>${author.last_30}</strong></article><article><span>Активных дней</span><strong>${activity.activeDays}</strong></article><article><span>За 7 дней</span><strong>${recent7Total}</strong></article><article><span>Проектов за 30 дней</span><strong>${activity.repositoryCount}</strong></article></div>
-      <section><div class="activity-heading"><div><h2>Коммиты по дням · последние 7 дней</h2><small>Даты и время — Минск</small></div><div class="last-commit"><span>Последний коммит</span><strong>${date(author.last_commit)}</strong></div></div>
-      <div class="activity-days">${recentDays.map((row) => `<${row.commits ? `a href="${escapeHtml(dayCommitsUrl(id, row.day))}"` : "div"} class="activity-day${row.commits ? " activity-day-link" : ""}"><span>${escapeHtml(dayLabel(row.day))}</span><div class="activity-track" aria-hidden="true"><div class="activity-fill" style="width:${row.commits ? Math.max(3, row.commits / max * 100) : 0}%"></div></div><strong>${row.commits}</strong></${row.commits ? "a" : "div"}>`).join("")}</div><details class="days-detail"><summary>Все активные дни за 30 дней (${activity.activeDays})</summary><div class="days-list">${[...activity.days].reverse().map((row) => `<a href="${escapeHtml(dayCommitsUrl(id, row.day))}"><span>${escapeHtml(dayLabel(row.day))}</span><strong>${row.commits} ${plural(row.commits, "коммит", "коммита", "коммитов")} →</strong></a>`).join("") || '<p class="muted">Коммитов за 30 дней нет.</p>'}</div></details></section>
-      <div class="profile-columns"><section><h2>Проекты за 30 дней</h2>${activity.repositories.map((repo) => `<a class="stat-line project-row" href="${escapeHtml(`/admin/commits?author=${id}&repository=${encodeURIComponent(repo.repository)}`)}"><span>${escapeHtml(repo.repository)}</span><strong>${repo.commits} <span aria-hidden="true">→</span></strong></a>`).join("") || '<p class="muted">Пока нет коммитов.</p>'}</section>
+      <div class="cards profile-cards"><article><span>Коммитов · ${escapeHtml(label)}</span><strong>${author.month_commits}</strong></article><article><span>Активных дней</span><strong>${activity.activeDays}</strong></article><article><span>Месяц</span><strong class="month-card-label">${escapeHtml(label)}</strong></article><article><span>Репозиториев · ${escapeHtml(label)}</span><strong>${activity.repositoryCount}</strong></article></div>
+      <section><div class="activity-heading"><div><h2>Коммиты по дням · ${escapeHtml(label)}</h2><small>Даты и время — Минск</small></div><div class="last-commit"><span>Последний коммит</span><strong>${date(author.last_commit)}</strong></div></div>
+      <div class="activity-days">${recentDays.map((row) => `<${row.commits ? `a href="${escapeHtml(dayCommitsUrl(id, row.day))}"` : "div"} class="activity-day${row.commits ? " activity-day-link" : ""}"><span>${escapeHtml(dayLabel(row.day))}</span><div class="activity-track" aria-hidden="true"><div class="activity-fill" style="width:${row.commits ? Math.max(3, row.commits / max * 100) : 0}%"></div></div><strong>${row.commits}</strong></${row.commits ? "a" : "div"}>`).join("")}</div><details class="days-detail"><summary>Все активные дни · ${escapeHtml(label)} (${activity.activeDays})</summary><div class="days-list">${[...activity.days].reverse().map((row) => `<a href="${escapeHtml(dayCommitsUrl(id, row.day))}"><span>${escapeHtml(dayLabel(row.day))}</span><strong>${row.commits} ${plural(row.commits, "коммит", "коммита", "коммитов")} →</strong></a>`).join("") || `<p class="muted">Коммитов · ${escapeHtml(label)} нет.</p>`}</div></details></section>
+      <div class="profile-columns"><section><h2>Репозитории · ${escapeHtml(label)}</h2>${activity.repositories.map((repo) => `<a class="stat-line project-row" href="${escapeHtml(`/admin/commits?author=${id}&repository=${encodeURIComponent(repo.repository)}`)}"><span>${escapeHtml(repo.repository)}</span><strong>${repo.commits} <span aria-hidden="true">→</span></strong></a>`).join("") || '<p class="muted">Пока нет коммитов.</p>'}</section>
       <section><h2>Итог по коммитам</h2><p class="muted">ИИ описывает темы работы по доступным коммитам. Это не оценка сотрудника.</p>${url.searchParams.has("insight_error") ? '<p class="error">Не удалось создать итог. Попробуйте позже; предыдущий итог сохранён.</p>' : ""}
-      ${insight ? `<p>${escapeHtml(insight.summary)}</p><small>Составлено ${date(insight.generated_at)} · на момент итога: ${insight.commit_count} коммитов за 30 дней</small><div class="evidence">${evidence.map((commit) => `<a href="${escapeHtml(commit.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(commit.message.split("\n")[0].slice(0, 95))} ↗</a>`).join("")}</div>` : '<p class="muted">Итог ещё не составлен.</p>'}
-      <form method="post" action="/admin/insight"><input type="hidden" name="csrf" value="${csrf}"><input type="hidden" name="id" value="${id}"><button data-loading-label="Составляю итог…" ${author.last_30 ? "" : "disabled"}>${insight ? "Обновить итог" : "Составить итог за 30 дней"}</button></form></section></div>
-      <section><div class="section-heading"><h2>Последние коммиты</h2><a href="/admin/commits?author=${id}">Вся история →</a></div><p class="muted commit-size-hint">Объём — изменённые строки и файлы. Он не показывает сложность или качество работы.</p>${activity.recent.slice(0, 10).map((commit) => `<div class="recent-commit"><a href="${escapeHtml(commit.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(commit.message.split("\n")[0])}</a><small>${escapeHtml(commit.repository)} · ${date(commit.committed_at)}</small>${commitDescription(commit)}${commitSize(commit, true)}</div>`).join("") || '<p class="muted">За последние 30 дней коммитов нет.</p>'}</section>`;
+      ${insight ? `<p>${escapeHtml(insight.summary)}</p><small>Составлено ${date(insight.generated_at)} · на момент итога: ${insight.commit_count} коммитов за ${escapeHtml(label)}</small><div class="evidence">${evidence.map((commit) => `<a href="${escapeHtml(commit.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(commit.message.split("\n")[0].slice(0, 95))} ↗</a>`).join("")}</div>` : '<p class="muted">Итог ещё не составлен.</p>'}
+      <form method="post" action="/admin/insight"><input type="hidden" name="csrf" value="${csrf}"><input type="hidden" name="id" value="${id}"><input type="hidden" name="month" value="${month}"><button data-loading-label="Составляю итог…" ${author.month_commits ? "" : "disabled"}>${insight ? "Обновить итог" : "Составить итог за ${escapeHtml(label)}"}</button></form></section></div>
+      <section><div class="section-heading"><h2>Последние коммиты</h2><a href="/admin/commits?author=${id}">Вся история →</a></div><p class="muted commit-size-hint">Объём — изменённые строки и файлы. Он не показывает сложность или качество работы.</p>${activity.recent.slice(0, 10).map((commit) => `<div class="recent-commit"><a href="${escapeHtml(commit.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(commit.message.split("\n")[0])}</a><small>${escapeHtml(commit.repository)} · ${date(commit.committed_at)}</small>${commitDescription(commit)}${commitSize(commit, true)}</div>`).join("") || '<p class="muted">За ${escapeHtml(label)} коммитов нет.</p>'}</section>`;
     sendHtml(response, page(author.name, content, true, csrf));
     return true;
   }
 
   if (url.pathname === "/admin/people") {
-    const all = store.authors();
+    const all = store.authors(month);
     const authors = combinedAuthors(all);
     const targets = all.filter((author) => !author.merged_into);
-    const content = `<h1>Сотрудники</h1><p class="muted">За последние 30 дней. Рейтинг — по коммитам; активные дни и проекты дают контекст.</p>
-      <section class="people-list"><div class="people-head"><span>Сотрудник</span><span>Коммиты</span><span>Дни</span><span>Проекты</span><span>Последний</span></div><div class="people-mobile-head"><span>Сотрудник</span><span>Коммиты</span><span>Дни</span></div>${authors.map((author) => { const activity = store.authorActivity(author.id); return `<a class="people-row" href="/admin/people/${author.id}"><span class="people-person"><strong>${escapeHtml(author.name)}</strong><small>${activity.repositoryCount} ${plural(activity.repositoryCount, "проект", "проекта", "проектов")}</small></span><span>${author.last_30}</span><span>${activity.activeDays}</span><span>${activity.repositoryCount}</span><small>${date(author.last_commit)}</small></a>`; }).join("") || '<p class="muted">Пока нет сотрудников.</p>'}</section>
+    const content = `<h1>Сотрудники</h1><form class="month-picker" method="get"><label for="month">Месяц</label><input id="month" name="month" type="month" min="2020-01" max="${currentMonth()}" value="${month}"><button>Показать</button></form><p class="muted">За ${escapeHtml(label)}. Рейтинг — по коммитам; активные дни и проекты дают контекст.</p>
+      <section class="people-list"><div class="people-head"><span>Сотрудник</span><span>Коммиты</span><span>Дни</span><span>Проекты</span><span>Последний</span></div><div class="people-mobile-head"><span>Сотрудник</span><span>Коммиты</span><span>Дни</span></div>${authors.map((author) => { const activity = store.authorActivity(author.id, month); return `<a class="people-row" href="/admin/people/${author.id}?month=${month}"><span class="people-person"><strong>${escapeHtml(author.name)}</strong><small>${activity.repositoryCount} ${plural(activity.repositoryCount, "проект", "проекта", "проектов")}</small></span><span>${author.month_commits}</span><span>${activity.activeDays}</span><span>${activity.repositoryCount}</span><small>${date(author.last_commit)}</small></a>`; }).join("") || '<p class="muted">Пока нет сотрудников.</p>'}</section>
       <details class="management"><summary>Управление авторами</summary><p class="muted">Авторы добавляются автоматически. Скрытые не входят в сводку; объединённые учитываются как один сотрудник.</p>
       ${all.map((author) => `<article class="person"><div><a href="/admin/commits?author=${author.id}">${escapeHtml(author.name)}</a> ${author.github_login ? `<small>@${escapeHtml(author.github_login)}</small>` : ""}
-      ${author.hidden ? `<small>Скрыт${author.merged_into ? " · объединён" : ""}</small>` : ""}<p>${author.commits} коммитов · за 30 дней: ${author.last_30} · последний: ${date(author.last_commit)}</p></div>
+      ${author.hidden ? `<small>Скрыт${author.merged_into ? " · объединён" : ""}</small>` : ""}<p>${author.commits} коммитов · за месяц: ${author.month_commits} · последний: ${date(author.last_commit)}</p></div>
       ${author.merged_into ? `<form method="post" action="/admin/unmerge"><input type="hidden" name="csrf" value="${csrf}"><input type="hidden" name="id" value="${author.id}"><button>Разъединить</button></form>` : `<form method="post" action="/admin/hide"><input type="hidden" name="csrf" value="${csrf}"><input type="hidden" name="id" value="${author.id}"><input type="hidden" name="hidden" value="${author.hidden ? 0 : 1}"><button>${author.hidden ? "Показать" : "Скрыть"}</button></form>`}
       ${!author.merged_into && targets.length > 1 ? `<form method="post" action="/admin/merge"><input type="hidden" name="csrf" value="${csrf}"><input type="hidden" name="id" value="${author.id}"><select name="target" required><option value="">Объединить с…</option>${targets.filter((target) => target.id !== author.id).map((target) => `<option value="${target.id}">${escapeHtml(target.name)}</option>`).join("")}</select><button>Объединить</button></form>` : ""}</article>`).join("") || "Пока нет авторов."}</details>`;
     sendHtml(response, page("Сотрудники", content, true, csrf));
@@ -178,7 +174,7 @@ export async function handleAdmin(request: IncomingMessage, response: ServerResp
       for (let offset = 0; offset < pending.length; offset += 20) await loadCommitStats(store, pending.slice(offset, offset + 20), config.githubApiToken);
       if (pending.length) commits = store.commits(filters);
     }
-    const content = `${selectedAuthor ? `<a class="back-link" href="/admin/people/${selectedAuthor.id}">← ${escapeHtml(selectedAuthor.name)}</a>` : ""}<h1>История коммитов</h1>${selectedAuthor && repository ? `<p class="muted">${escapeHtml(selectedAuthor.name)} · ${escapeHtml(repository)}</p>` : ""}<form class="filters" method="get" action="/admin/commits">
+    const content = `${selectedAuthor ? `<a class="back-link" href="/admin/people/${selectedAuthor.id}?month=${month}">← ${escapeHtml(selectedAuthor.name)}</a>` : ""}<h1>История коммитов</h1>${selectedAuthor && repository ? `<p class="muted">${escapeHtml(selectedAuthor.name)} · ${escapeHtml(repository)}</p>` : ""}<form class="filters" method="get" action="/admin/commits">
       <select name="author" aria-label="Сотрудник"><option value="">Все авторы</option>${authors.map((person) => `<option value="${person.id}" ${person.id === author ? "selected" : ""}>${escapeHtml(person.name)}</option>`).join("")}</select>
       <select name="repository" aria-label="Проект"><option value="">Все проекты</option>${repositories.map((name) => `<option value="${escapeHtml(name)}" ${name === repository ? "selected" : ""}>${escapeHtml(name)}</option>`).join("")}</select>
       <label>С <input type="date" name="from" value="${from ?? ""}"></label><label>По <input type="date" name="to" value="${to ?? ""}"></label><button>Показать</button></form>
@@ -209,16 +205,11 @@ function combinedAuthors(authors: Author[]): Author[] {
     const root = roots.get(author.merged_into);
     if (root) {
       root.commits += author.commits;
-      root.last_7 += author.last_7;
-      root.last_30 += author.last_30;
+      root.month_commits += author.month_commits;
       if (author.last_commit && (!root.last_commit || author.last_commit > root.last_commit)) root.last_commit = author.last_commit;
     }
   }
-  return [...roots.values()].sort((a, b) => b.last_30 - a.last_30);
-}
-
-function authorTable(authors: Author[]): string {
-  return `<div class="table"><div class="table-head"><span>Автор</span><span>7 дн.</span><span>30 дн.</span><span>Последний</span></div>${authors.map((author) => `<a class="table-row" href="/admin/commits?author=${author.id}"><span>${escapeHtml(author.name)}</span><span>${author.last_7}</span><span>${author.last_30}</span><span>${date(author.last_commit)}</span></a>`).join("")}</div>`;
+  return [...roots.values()].sort((a, b) => b.month_commits - a.month_commits);
 }
 
 function commitDescription(commit: CommitRow): string {
@@ -263,7 +254,7 @@ function loginPage(error: boolean): string {
 }
 
 function page(title: string, content: string, authenticated: boolean, csrf = ""): string {
-  return `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)} · Manager Bot</title><style>${css}${mobileHeaderCss}${dashboardCss}${polishCss}${interactionCss}${responsiveFilterCss}${activityCss}${profileDetailCss}</style></head><body>
+  return `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)} · Manager Bot</title><style>${css}${mobileHeaderCss}${dashboardCss}${polishCss}${interactionCss}${responsiveFilterCss}${activityCss}${profileDetailCss}${monthCss}</style></head><body>
     ${authenticated ? `<header><a class="brand" href="/admin">Manager Bot</a><nav><a href="/admin">Обзор</a><a href="/admin/people">Сотрудники</a><a href="/admin/commits">Коммиты</a><a href="/admin/import">Загрузка</a></nav><form method="post" action="/admin/logout"><input type="hidden" name="csrf" value="${csrf}"><button class="quiet" data-loading-label="Выходим…">Выйти</button></form></header>` : ""}
     <main>${content}</main><script>${interactionJs}</script></body></html>`;
 }
@@ -276,6 +267,7 @@ const interactionCss = `.project-row{color:inherit;cursor:pointer;align-items:ce
 const responsiveFilterCss = `.commit-hint{font-size:13px;margin:-6px 0 18px}@media(max-width:600px){.filters select{width:100%;min-width:0}.filters label{flex:1 1 130px;min-width:0}.filters label input{width:100%;min-width:0}.filters button{min-width:120px}}`;
 const activityCss = `.activity-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;margin-bottom:22px}.activity-heading h2{margin-bottom:4px}.last-commit{display:flex;flex-direction:column;gap:4px;text-align:right;white-space:nowrap}.last-commit span{font-size:12px;color:#647084}.last-commit strong{font-size:16px}.activity-days{display:grid;gap:12px}.activity-day{display:grid;grid-template-columns:140px minmax(0,1fr) 64px;align-items:center;gap:14px;font-size:14px}.activity-day strong{text-align:right;font-size:16px}.activity-track{height:13px;border-radius:7px;background:#e9eef6;overflow:hidden}.activity-fill{height:100%;border-radius:7px;background:#4678db}@media(max-width:600px){.activity-heading{flex-wrap:wrap;gap:14px}.last-commit{text-align:left}.activity-day{grid-template-columns:90px minmax(0,1fr) 35px;gap:8px;font-size:12px}.activity-day strong{font-size:14px}}@media(prefers-color-scheme:dark){.last-commit span{color:#a5b4c7}.activity-track{background:#344155}.activity-fill{background:#7ca6ff}.project-row,.project-row:visited{color:#edf2f8}}`;
 const profileDetailCss = `.activity-day-link{color:inherit;border-radius:7px;margin:-3px -7px;padding:3px 7px}.activity-day-link:hover,.days-list a:hover{background:#eef3fd;text-decoration:none}.activity-day-link strong:after{content:' →';color:#305cb8}.days-detail{margin-top:20px;border-top:1px solid #e0e6ef;padding-top:12px}.days-detail summary{cursor:pointer;color:#305cb8;font-weight:600}.days-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px 24px;margin-top:12px}.days-list a{display:flex;justify-content:space-between;gap:12px;padding:8px;color:inherit;border-radius:6px}.commit-size{display:block;margin-top:5px;font-size:12px}.commit-size span:first-child{color:#247851}.commit-size span:last-child{color:#ba4b4b}.commit-size-hint{font-size:13px;margin-top:-8px}@media(max-width:600px){.days-list{grid-template-columns:1fr}}@media(prefers-color-scheme:dark){.activity-day-link:hover,.days-list a:hover{background:#263c58}.activity-day-link strong:after,.days-detail summary{color:#92b5ff}.days-detail{border-color:#334155}.commit-size span:first-child{color:#7bd8a6}.commit-size span:last-child{color:#ff9a9a}}`;
+const monthCss = `.month-picker{display:flex;align-items:end;gap:10px;margin:0 0 22px}.month-picker label{display:flex;flex-direction:column;gap:5px;font-size:13px;color:#647084}.month-picker input{min-width:170px}.month-card-label{font-size:20px!important}@media(max-width:600px){.month-picker{flex-wrap:wrap}.month-picker input{min-width:0}}@media(prefers-color-scheme:dark){.month-picker label{color:#a5b4c7}}`;
 const interactionJs = `document.addEventListener('submit',function(event){const form=event.target;if(!(form instanceof HTMLFormElement))return;if(form.dataset.submitting==='1'){event.preventDefault();return}const button=event.submitter instanceof HTMLButtonElement?event.submitter:form.querySelector('button');if(!button)return;form.dataset.submitting='1';button.dataset.originalLabel=button.textContent||'';button.textContent=button.dataset.loadingLabel||(form.action.endsWith('/login')?'Входим…':form.method.toLowerCase()==='get'?'Показываю…':'Сохраняю…');button.classList.add('is-loading');button.setAttribute('aria-busy','true');button.disabled=true});document.addEventListener('change',function(event){const select=event.target;if(!(select instanceof HTMLSelectElement)||select.name!=='author'||!select.form||!select.form.action.endsWith('/commits'))return;const repository=select.form.elements.namedItem('repository');if(repository instanceof HTMLSelectElement)repository.value='';select.form.requestSubmit()});window.addEventListener('pageshow',function(){document.querySelectorAll('form[data-submitting="1"]').forEach(function(form){form.dataset.submitting='0';form.querySelectorAll('button.is-loading').forEach(function(button){button.textContent=button.dataset.originalLabel||button.textContent;button.disabled=false;button.classList.remove('is-loading');button.removeAttribute('aria-busy')})})});`;
 
 function getSession(request: IncomingMessage, secret: string): string | null {
