@@ -114,6 +114,11 @@ export class CommitStore {
       this.db.prepare("UPDATE projects SET description = ? WHERE name = 'onroter' AND description = ''").run(initialProjectDescriptions.onroter);
       this.db.prepare("INSERT INTO catalog_meta(key, value) VALUES ('grounded_descriptions_v1', 'done')").run();
     }
+    if (!this.db.prepare("SELECT 1 FROM catalog_meta WHERE key = 'grounded_descriptions_v2'").get()) {
+      const entry = initialTrackerSources.onroter;
+      this.db.prepare("UPDATE projects SET tracker_context = ?, tracker_context_url = ? WHERE name = 'onroter' AND tracker_context = ''").run(entry.text, entry.url);
+      this.db.prepare("INSERT INTO catalog_meta(key, value) VALUES ('grounded_descriptions_v2', 'done')").run();
+    }
     if (!this.db.prepare("SELECT 1 FROM catalog_meta WHERE key = 'initial_mapping'").get()) {
       for (const repo of this.repositories()) this.assignInitialProject(repo.full_name);
       this.db.prepare("INSERT INTO catalog_meta(key, value) VALUES ('initial_mapping', 'done')").run();

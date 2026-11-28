@@ -8,6 +8,7 @@ test("project documents prefer overview and specifications over irrelevant files
     { path: "docs/specifications/product-vision.md", type: "blob", size: 200 },
     { path: "README.md", type: "blob", size: 200 },
     { path: "node_modules/foo/README.md", type: "blob", size: 200 },
+    { path: "apps/api/knowledge-base/About-Partner.md", type: "blob", size: 200 },
   ];
   assert.deepEqual(rankProjectDocuments(files), ["README.md", "docs/specifications/product-vision.md"]);
 });

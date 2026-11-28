@@ -5,9 +5,9 @@ type GitHubFile = { path: string; type: string; size?: number };
 
 export function rankProjectDocuments(files: GitHubFile[]): string[] {
   const score = (path: string): number => {
-    if (!/\.(md|mdx|txt)$/i.test(path) || /(^|\/)(node_modules|vendor|dist|build|coverage)\//i.test(path)) return -1;
+    if (!/\.(md|mdx|txt)$/i.test(path) || /(^|\/)(node_modules|vendor|dist|build|coverage|knowledge-base)\//i.test(path)) return -1;
     if (/^readme\.[^.]+$/i.test(path)) return 120;
-    if (/(^|\/)(about[-_ ]|product[-_ ]?(overview|vision|brief)|overview|prd|project[-_ ]?spec)/i.test(path)) return 110 - path.split("/").length * 2;
+    if (/(^|\/)(about[-_ ]|product[-_ ]?(overview|vision|brief)|overview|prd|architecture|project[-_ ]?spec)/i.test(path)) return 110 - path.split("/").length * 2;
     if (/(^|\/)(specifications?|specs|requirements)(\/|\.)/i.test(path)) return 70 - path.split("/").length;
     if (/(^|\/)readme\.[^.]+$/i.test(path) && !/(^|\/)(src|assets|test|tests)\//i.test(path)) return 40 - path.split("/").length;
     return -1;
@@ -39,7 +39,7 @@ export async function collectProjectSources(project: Project, githubToken: strin
       const tree = await treeResponse.json() as { tree?: GitHubFile[] };
       const ranked = rankProjectDocuments(tree.tree || []);
       const rootReadme = ranked.find((path) => /^readme\./i.test(path));
-      const productDocs = ranked.filter((path) => /(^|\/)(about[-_ ]|product[-_ ]?(overview|vision|brief)|overview|prd|project[-_ ]?spec)/i.test(path)).slice(0, 2);
+      const productDocs = ranked.filter((path) => /(^|\/)(about[-_ ]|product[-_ ]?(overview|vision|brief)|overview|prd|architecture|project[-_ ]?spec)/i.test(path)).slice(0, 2);
       const specs = ranked.filter((path) => /(^|\/)(specifications?|specs|requirements)(\/|\.)/i.test(path) && !productDocs.includes(path));
       const selected = [...(rootReadme ? [rootReadme] : []), ...productDocs];
       if (selected.length < 2) selected.push(...specs.slice(0, 2 - selected.length));

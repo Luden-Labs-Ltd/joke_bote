@@ -43,6 +43,7 @@ export const initialTrackerSources: Record<string, { url: string; text: string }
   ClinIvue: { url: "https://tracker.luden-labs.com/project/projects/2798649a-3bed-40a7-902d-04cc63d4bde3/issues/", text: "Цель этапа M1 — безопасно записывать фрагменты диктовки клинициста на иврите с мобильного устройства. Доступ ограничен организацией и владением случаем; генерацию отчётов M2 нельзя считать готовой до окончания проверки M1." },
   "BGU Entrepreneurship": { url: "https://tracker.luden-labs.com/project/projects/4fc30268-8949-42aa-89f9-3be8638688ac/issues/", text: "Учебный компаньон курса предпринимательства Университета Бен-Гуриона: уроки, задания, ИИ-наставник, взаимная проверка и портфолио." },
   invoice: { url: "https://tracker.luden-labs.com/project/projects/180029ec-80f7-4993-a952-323f9b8b4727/issues/", text: "В трекере проект invoice содержит отдельные карточки invoice 04.2026, 05.2026, 06.2026, 07.2026, 08.2026, 09.2026, 10.2026 и 11.2026. Репозитории к проекту не привязаны." },
+  onroter: { url: "https://tracker.luden-labs.com/project/projects/c6bf82ca-37ce-4e78-9f1a-4cfb941460e9/issues/", text: "По карточкам проекта: пациент проходит задания уровня и пишет рефлексию, ведёт дневник, общается с ментором и ИИ-помощником. Ментор и администратор сопровождают семьи и пациентов. Это приложение для поддержки людей на пути восстановления от зависимостей." },
 };
 
 export function initialProjectForRepository(repository: string): string | undefined {
