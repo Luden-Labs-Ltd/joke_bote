@@ -34,6 +34,39 @@ test("calendar months include their own first and last days in Minsk", () => {
   } finally { rmSync(folder, { recursive: true, force: true }); }
 });
 
+test("product catalog groups repositories, keeps tracker-only projects and publishes reviewed drafts", () => {
+  const folder = mkdtempSync(join(tmpdir(), "manager-projects-"));
+  try {
+    const path = join(folder, "commits.sqlite");
+    const store = new CommitStore(path);
+    const insert = (repository, sha) => store.upsertCommit({ repository, sha: sha.repeat(40), message: "Change", committedAt: "2026-11-14T12:00:00Z", authorName: "Alice", authorLogin: "alice", url: `https://github.com/${repository}/commit/${sha}` });
+    insert("org/voice-api", "a");
+    insert("org/voice-student", "b");
+    insert("org/unmatched", "c");
+    const voice = store.projects("2026-11").find((project) => project.name === "Voice");
+    assert.equal(voice.commits, 2);
+    assert.equal(voice.repositories.length, 2);
+    assert.equal(voice.contributors, 1);
+    assert.match(voice.description, /анализом чтения/);
+    assert.match(voice.tracker_url, /tracker\.luden-labs\.com/);
+    assert.equal(store.projects("2026-11").find((project) => project.name === "invoice").commits, 0);
+    assert.deepEqual(store.unassignedRepositories(), ["org/unmatched"]);
+    assert.equal(store.commits({ project: voice.id }).length, 2);
+    store.assignRepository("org/unmatched", voice.id);
+    assert.equal(store.projects("2026-11").find((project) => project.id === voice.id).commits, 3);
+    store.saveProjectDraft(voice.id, "Черновик о продукте");
+    assert.equal(store.projects("2026-11").find((project) => project.id === voice.id).description, voice.description);
+    store.publishProjectDraft(voice.id);
+    assert.equal(store.projects("2026-11").find((project) => project.id === voice.id).description, "Черновик о продукте");
+    store.assignRepository("org/unmatched", null);
+    assert.deepEqual(store.unassignedRepositories(), ["org/unmatched"]);
+    store.assignRepository("org/voice-api", null);
+    const reopened = new CommitStore(path);
+    assert.equal(reopened.projects("2026-11").find((project) => project.id === voice.id).description, "Черновик о продукте");
+    assert.ok(reopened.unassignedRepositories().includes("org/voice-api"));
+  } finally { rmSync(folder, { recursive: true, force: true }); }
+});
+
 test("commit storage deduplicates pushes, keeps authors and aggregates merged authors", () => {
   const folder = mkdtempSync(join(tmpdir(), "manager-bot-"));
   try {

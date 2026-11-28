@@ -2,6 +2,7 @@ import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { currentMonth, nextMonth } from "./month.js";
+import { initialProjectDescriptions, initialProjectForRepository, projectSeeds } from "./project-seeds.js";
 
 export type CommitInput = {
   repository: string;
@@ -20,6 +21,7 @@ export type CommitRow = { repository: string; sha: string; message: string; comm
 export type Repository = { full_name: string; status: string; error: string | null; updated_at: string | null; commit_count: number };
 export type AuthorActivity = { activeDays: number; repositoryCount: number; days: { day: string; commits: number }[]; repositories: { repository: string; commits: number }[]; recent: CommitRow[] };
 export type AuthorInsight = { summary: string; evidence: string[]; generated_at: string; commit_count: number };
+export type Project = { id: number; name: string; description: string; draft: string; tracker_url: string; repositories: string[]; commits: number; contributors: number; last_commit: string | null };
 
 export class CommitStore {
   private db: Database.Database;
@@ -70,11 +72,78 @@ export class CommitStore {
         changed_files INTEGER, checked_at TEXT NOT NULL,
         PRIMARY KEY(repository, sha), FOREIGN KEY(repository, sha) REFERENCES commits(repository, sha)
       );
+      CREATE TABLE IF NOT EXISTS projects (
+        id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, description TEXT NOT NULL DEFAULT '',
+        draft TEXT NOT NULL DEFAULT '', tracker_url TEXT NOT NULL DEFAULT ''
+      );
+      CREATE TABLE IF NOT EXISTS project_repositories (
+        repository TEXT PRIMARY KEY REFERENCES repositories(full_name), project_id INTEGER NOT NULL REFERENCES projects(id)
+      );
+      CREATE TABLE IF NOT EXISTS catalog_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     `);
+    const seed = this.db.prepare("INSERT OR IGNORE INTO projects(name, tracker_url) VALUES (?, ?)");
+    for (const [name, trackerId] of projectSeeds) seed.run(name, `https://tracker.luden-labs.com/project/projects/${trackerId}/issues/`);
+    if (!this.db.prepare("SELECT 1 FROM catalog_meta WHERE key = 'initial_descriptions'").get()) {
+      const describe = this.db.prepare("UPDATE projects SET description = ? WHERE name = ? AND description = '' AND draft = ''");
+      for (const [name, description] of Object.entries(initialProjectDescriptions)) describe.run(description, name);
+      this.db.prepare("INSERT INTO catalog_meta(key, value) VALUES ('initial_descriptions', 'done')").run();
+    }
+    if (!this.db.prepare("SELECT 1 FROM catalog_meta WHERE key = 'initial_mapping'").get()) {
+      for (const repo of this.repositories()) this.assignInitialProject(repo.full_name);
+      this.db.prepare("INSERT INTO catalog_meta(key, value) VALUES ('initial_mapping', 'done')").run();
+    }
   }
 
   addRepository(name: string): void {
-    this.db.prepare("INSERT OR IGNORE INTO repositories(full_name) VALUES (?)").run(name);
+    const inserted = this.db.prepare("INSERT OR IGNORE INTO repositories(full_name) VALUES (?)").run(name);
+    if (inserted.changes) this.assignInitialProject(name);
+  }
+
+  private assignInitialProject(repository: string): void {
+    const name = initialProjectForRepository(repository);
+    if (!name) return;
+    this.db.prepare(`INSERT OR IGNORE INTO project_repositories(repository, project_id)
+      SELECT ?, id FROM projects WHERE name = ?`).run(repository, name);
+  }
+
+  projects(month = currentMonth()): Project[] {
+    const rows = this.db.prepare(`SELECT p.*, COUNT(DISTINCT pr.repository) AS repository_count,
+      COUNT(c.sha) AS commits, COUNT(DISTINCT c.author_id) AS contributors, MAX(c.committed_at) AS last_commit
+      FROM projects p LEFT JOIN project_repositories pr ON pr.project_id = p.id
+      LEFT JOIN commits c ON c.repository = pr.repository AND date(c.committed_at, '+3 hours') >= ? AND date(c.committed_at, '+3 hours') < ?
+      GROUP BY p.id ORDER BY commits DESC, p.name COLLATE NOCASE`).all(`${month}-01`, `${nextMonth(month)}-01`) as (Omit<Project, "repositories"> & { repository_count: number })[];
+    const repositoryRows = this.db.prepare("SELECT project_id, repository FROM project_repositories ORDER BY repository").all() as { project_id: number; repository: string }[];
+    return rows.map((row) => ({ ...row, repositories: repositoryRows.filter((entry) => entry.project_id === row.id).map((entry) => entry.repository) }));
+  }
+
+  unassignedRepositories(): string[] {
+    return this.db.prepare(`SELECT r.full_name FROM repositories r LEFT JOIN project_repositories pr ON pr.repository = r.full_name
+      WHERE pr.repository IS NULL ORDER BY r.full_name`).all().map((row) => (row as { full_name: string }).full_name);
+  }
+
+  createProject(name: string, trackerUrl = ""): number {
+    const result = this.db.prepare("INSERT INTO projects(name, tracker_url) VALUES (?, ?)").run(name.trim(), trackerUrl.trim());
+    return Number(result.lastInsertRowid);
+  }
+
+  updateProject(id: number, name: string, description: string, trackerUrl: string): void {
+    this.db.prepare("UPDATE projects SET name = ?, description = ?, tracker_url = ?, draft = '' WHERE id = ?")
+      .run(name.trim(), description.trim(), trackerUrl.trim(), id);
+  }
+
+  saveProjectDraft(id: number, draft: string): void {
+    this.db.prepare("UPDATE projects SET draft = ? WHERE id = ?").run(draft.trim(), id);
+  }
+
+  publishProjectDraft(id: number): void {
+    this.db.prepare("UPDATE projects SET description = draft, draft = '' WHERE id = ? AND draft != ''").run(id);
+  }
+
+  assignRepository(repository: string, projectId: number | null): void {
+    if (!this.hasRepository(repository)) throw new Error("Репозиторий не найден");
+    if (projectId !== null && !this.db.prepare("SELECT 1 FROM projects WHERE id = ?").get(projectId)) throw new Error("Проект не найден");
+    if (projectId === null) this.db.prepare("DELETE FROM project_repositories WHERE repository = ?").run(repository);
+    else this.db.prepare("INSERT INTO project_repositories(repository, project_id) VALUES (?, ?) ON CONFLICT(repository) DO UPDATE SET project_id = excluded.project_id").run(repository, projectId);
   }
 
   hasRepository(name: string): boolean {
@@ -204,11 +273,12 @@ export class CommitStore {
     return this.db.prepare("SELECT repository, branch, status, error FROM backfill ORDER BY repository, branch").all() as { repository: string; branch: string; status: string; error: string | null }[];
   }
 
-  commits(filters: { author?: number; repository?: string; from?: string; to?: string; page?: number }): CommitRow[] {
+  commits(filters: { author?: number; repository?: string; project?: number; from?: string; to?: string; page?: number }): CommitRow[] {
     const conditions: string[] = [];
     const values: (string | number)[] = [];
     if (filters.author) { conditions.push("(c.author_id = ? OR a.merged_into = ?)"); values.push(filters.author, filters.author); }
     if (filters.repository) { conditions.push("c.repository = ?"); values.push(filters.repository); }
+    if (filters.project) { conditions.push("EXISTS (SELECT 1 FROM project_repositories pr WHERE pr.repository = c.repository AND pr.project_id = ?)"); values.push(filters.project); }
     if (filters.from) { conditions.push("datetime(c.committed_at, '+3 hours') >= datetime(?)"); values.push(`${filters.from}T00:00:00Z`); }
     if (filters.to) { conditions.push("datetime(c.committed_at, '+3 hours') < datetime(?, '+1 day')"); values.push(`${filters.to}T00:00:00Z`); }
     const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";

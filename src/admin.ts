@@ -3,6 +3,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Author, CommitRow, CommitStore } from "./commit-store.js";
 import { generateAuthorInsight } from "./author-insight.js";
 import { currentMonth, monthDays, monthLabel, selectedMonth } from "./month.js";
+import { generateProjectDraft } from "./project-description.js";
 
 type AdminConfig = { email: string; passwordHash: string; sessionSecret: string; geminiApiKey?: string; geminiModel?: string; githubApiToken?: string };
 const failedLogins = new Map<string, { attempts: number; until: number }>();
@@ -72,6 +73,44 @@ export async function handleAdmin(request: IncomingMessage, response: ServerResp
     const id = Number(form.get("id"));
     const postMonth = selectedMonth(form.get("month"));
     try {
+      if (url.pathname.startsWith("/admin/projects/")) {
+        const action = url.pathname.slice("/admin/projects/".length);
+        const projectId = Number(form.get("project_id"));
+        const tracker = form.get("tracker_url")?.trim() || "";
+        if (tracker && !/^https:\/\/tracker\.luden-labs\.com\/project\//.test(tracker)) throw new Error("Укажите ссылку на проект в трекере");
+        if (action === "create") {
+          const name = form.get("name")?.trim() || "";
+          if (!name || name.length > 100) throw new Error("Укажите название проекта до 100 символов");
+          const created = store.createProject(name, tracker);
+          redirect(response, `/admin/projects/${created}?month=${postMonth}`);
+          return true;
+        }
+        if (!Number.isSafeInteger(projectId) || projectId < 1) { response.writeHead(400).end(); return true; }
+        const project = store.projects(postMonth).find((item) => item.id === projectId);
+        if (!project) { response.writeHead(404).end(); return true; }
+        if (action === "save") {
+          const name = form.get("name")?.trim() || "";
+          const description = form.get("description")?.trim() || "";
+          if (!name || name.length > 100 || description.length > 2000) throw new Error("Проверьте название и описание");
+          store.updateProject(projectId, name, description, tracker);
+        } else if (action === "assign") {
+          const repository = form.get("repository") || "";
+          const target = form.get("target") || "";
+          store.assignRepository(repository, target === "none" ? null : Number(target));
+        } else if (action === "draft") {
+          if (!config.geminiApiKey || !config.githubApiToken) throw new Error("Для черновика нужны GitHub и Gemini");
+          const draft = await generateProjectDraft(project, config.githubApiToken, config.geminiApiKey, config.geminiModel || "gemini-2.5-flash");
+          if (!draft) throw new Error("Недостаточно данных для описания; добавьте его вручную");
+          store.saveProjectDraft(projectId, draft);
+        } else if (action === "save-draft") {
+          const draft = form.get("draft")?.trim() || "";
+          if (draft.length > 2000) throw new Error("Черновик слишком длинный");
+          store.saveProjectDraft(projectId, draft);
+        } else if (action === "publish") store.publishProjectDraft(projectId);
+        else { response.writeHead(404).end(); return true; }
+        redirect(response, `/admin/projects/${projectId}?month=${postMonth}`);
+        return true;
+      }
       if (url.pathname === "/admin/insight" && Number.isSafeInteger(id) && id > 0) {
         const author = combinedAuthors(store.authors(postMonth)).find((person) => person.id === id);
         if (!author) { response.writeHead(404).end(); return true; }
@@ -113,6 +152,32 @@ export async function handleAdmin(request: IncomingMessage, response: ServerResp
       <section><h2>Динамика коммитов · ${escapeHtml(label)}</h2><div class="chart">${trend.map((row, index) => `<div class="bar-wrap" title="${escapeHtml(row.day)}: ${row.commits}"><div class="bar" style="height:${row.commits ? Math.max(4, row.commits / max * 100) : 0}%"></div><small>${index % 5 === 0 || index === trend.length - 1 ? escapeHtml(row.day.slice(5)) : ""}</small></div>`).join("")}</div></section>`;
     sendHtml(response, page("Обзор", content, true, csrf));
     return true;
+  }
+
+  if (url.pathname === "/admin/projects") {
+    const projects = store.projects(month);
+    const unassigned = store.unassignedRepositories();
+    const content = `<h1>Проекты</h1><p class="muted">Один продукт может объединять несколько репозиториев. Описания публикуются после проверки.</p>${monthPicker(month)}
+      <section><h2>Добавить продукт</h2><form class="project-form" method="post" action="/admin/projects/create"><input type="hidden" name="csrf" value="${csrf}"><input type="hidden" name="month" value="${month}"><label>Название<input name="name" maxlength="100" required></label><label>Ссылка на трекер<input name="tracker_url" type="url" placeholder="https://tracker.luden-labs.com/project/..."></label><button>Добавить</button></form></section>
+      <div class="project-grid">${projects.map((project) => `<a class="project-tile" href="/admin/projects/${project.id}?month=${month}"><strong>${escapeHtml(project.name)}</strong><span>${escapeHtml(project.description || "Описание ещё не опубликовано")}</span><small>${project.repositories.length} ${plural(project.repositories.length, "репозиторий", "репозитория", "репозиториев")} · ${project.commits} ${plural(project.commits, "коммит", "коммита", "коммитов")} · ${project.contributors} ${plural(project.contributors, "автор", "автора", "авторов")}</small>${project.draft ? '<em>Есть черновик</em>' : ""}</a>`).join("")}</div>
+      ${unassigned.length ? `<section><h2>Репозитории без продукта</h2><p class="muted">Они видны отдельно, пока вы не привяжете их к продукту.</p>${unassigned.map((repo) => `<a class="stat-line" href="/admin/commits?repository=${encodeURIComponent(repo)}"><span>${escapeHtml(repo)}</span><span>Коммиты →</span></a>`).join("")}</section>` : ""}`;
+    sendHtml(response, page("Проекты", content, true, csrf)); return true;
+  }
+
+  const projectMatch = url.pathname.match(/^\/admin\/projects\/(\d+)$/);
+  if (projectMatch) {
+    const project = store.projects(month).find((item) => item.id === Number(projectMatch[1]));
+    if (!project) { response.writeHead(404).end(); return true; }
+    const repositories = store.repositories().map((repo) => repo.full_name);
+    const assigned = new Map(store.projects(month).flatMap((item) => item.repositories.map((repo) => [repo, item.name] as const)));
+    const content = `<a class="back-link" href="/admin/projects?month=${month}">← Все проекты</a><h1>${escapeHtml(project.name)}</h1>${monthPicker(month)}
+      <div class="cards"><article><span>Коммитов · ${escapeHtml(label)}</span><strong>${project.commits}</strong></article><article><span>Авторов</span><strong>${project.contributors}</strong></article><article><span>Репозиториев</span><strong>${project.repositories.length}</strong></article><article><span>Последний коммит в месяце</span><strong class="month-card-label">${date(project.last_commit)}</strong></article></div>
+      <section><h2>О продукте</h2><p>${escapeHtml(project.description || "Описание пока не опубликовано.")}</p>${project.tracker_url ? `<p><a href="${escapeHtml(project.tracker_url)}" target="_blank" rel="noopener noreferrer">Открыть в трекере ↗</a></p>` : ""}
+      <form class="project-form" method="post" action="/admin/projects/save"><input type="hidden" name="csrf" value="${csrf}"><input type="hidden" name="project_id" value="${project.id}"><input type="hidden" name="month" value="${month}"><label>Название<input name="name" value="${escapeHtml(project.name)}" maxlength="100" required></label><label>Ссылка на трекер<input name="tracker_url" type="url" value="${escapeHtml(project.tracker_url)}"></label><label class="wide">Описание<textarea name="description" maxlength="2000" rows="4">${escapeHtml(project.description)}</textarea></label><button>Сохранить</button></form></section>
+      <section><h2>Черновик описания</h2><p class="muted">ИИ использует доступные описания и README привязанных репозиториев. Проверьте текст перед публикацией.</p>${project.draft ? `<form class="project-form" method="post" action="/admin/projects/save-draft"><input type="hidden" name="csrf" value="${csrf}"><input type="hidden" name="project_id" value="${project.id}"><input type="hidden" name="month" value="${month}"><label class="wide">Текст черновика<textarea name="draft" maxlength="2000" rows="4">${escapeHtml(project.draft)}</textarea></label><button>Сохранить правки</button></form><form method="post" action="/admin/projects/publish"><input type="hidden" name="csrf" value="${csrf}"><input type="hidden" name="project_id" value="${project.id}"><input type="hidden" name="month" value="${month}"><button>Опубликовать черновик</button></form>` : '<p class="muted">Черновика пока нет.</p>'}<form method="post" action="/admin/projects/draft"><input type="hidden" name="csrf" value="${csrf}"><input type="hidden" name="project_id" value="${project.id}"><input type="hidden" name="month" value="${month}"><button data-loading-label="Готовлю черновик…" ${project.repositories.length ? "" : "disabled"}>Создать черновик с ИИ</button></form></section>
+      <section><h2>Репозитории</h2>${project.repositories.map((repo) => `<a class="stat-line" href="/admin/commits?project=${project.id}&repository=${encodeURIComponent(repo)}"><span>${escapeHtml(repo)}</span><strong>История →</strong></a>`).join("") || '<p class="muted">Репозитории пока не привязаны.</p>'}<p><a href="/admin/commits?project=${project.id}&from=${month}-01&to=${monthDays(month).at(-1)}">Все коммиты продукта за ${escapeHtml(label)} →</a></p>
+      <form class="project-form" method="post" action="/admin/projects/assign"><input type="hidden" name="csrf" value="${csrf}"><input type="hidden" name="project_id" value="${project.id}"><input type="hidden" name="month" value="${month}"><label>Репозиторий<select name="repository" required><option value="">Выберите репозиторий</option>${repositories.map((repo) => `<option value="${escapeHtml(repo)}">${escapeHtml(repo)}${assigned.has(repo) ? ` · ${escapeHtml(assigned.get(repo) || "")}` : ""}</option>`).join("")}</select></label><label>Продукт<select name="target"><option value="${project.id}">${escapeHtml(project.name)}</option><option value="none">Без продукта</option>${store.projects(month).filter((item) => item.id !== project.id).map((item) => `<option value="${item.id}">${escapeHtml(item.name)}</option>`).join("")}</select></label><button>Применить</button></form></section>`;
+    sendHtml(response, page(project.name, content, true, csrf)); return true;
   }
 
   const profile = url.pathname.match(/^\/admin\/people\/(\d+)$/);
@@ -159,23 +224,27 @@ export async function handleAdmin(request: IncomingMessage, response: ServerResp
 
   if (url.pathname === "/admin/commits") {
     const author = Number(url.searchParams.get("author")) || undefined;
+    const project = Number(url.searchParams.get("project")) || undefined;
     const authors = store.authors().filter((person) => !person.merged_into);
     const selectedAuthor = authors.find((person) => person.id === author);
-    const repositories = author ? store.repositoriesByAuthor(author) : store.repositories().map((repo) => repo.full_name);
+    const selectedProject = store.projects(month).find((item) => item.id === project);
+    const authorRepositories = author ? store.repositoriesByAuthor(author) : store.repositories().map((repo) => repo.full_name);
+    const repositories = selectedProject ? authorRepositories.filter((repo) => selectedProject.repositories.includes(repo)) : authorRepositories;
     const requestedRepository = url.searchParams.get("repository") || undefined;
     const repository = requestedRepository && repositories.includes(requestedRepository) ? requestedRepository : undefined;
     const from = validDate(url.searchParams.get("from"));
     const to = validDate(url.searchParams.get("to"));
     const currentPage = Math.max(1, Number(url.searchParams.get("page")) || 1);
-    const filters = { author, repository, from, to, page: currentPage };
+    const filters = { author, project: selectedProject?.id, repository, from, to, page: currentPage };
     let commits = store.commits(filters);
     if (author && config.githubApiToken) {
       const pending = store.commitsNeedingStats(commits);
       for (let offset = 0; offset < pending.length; offset += 20) await loadCommitStats(store, pending.slice(offset, offset + 20), config.githubApiToken);
       if (pending.length) commits = store.commits(filters);
     }
-    const content = `${selectedAuthor ? `<a class="back-link" href="/admin/people/${selectedAuthor.id}?month=${month}">← ${escapeHtml(selectedAuthor.name)}</a>` : ""}<h1>История коммитов</h1>${selectedAuthor && repository ? `<p class="muted">${escapeHtml(selectedAuthor.name)} · ${escapeHtml(repository)}</p>` : ""}<form class="filters" method="get" action="/admin/commits">
+    const content = `${selectedAuthor ? `<a class="back-link" href="/admin/people/${selectedAuthor.id}?month=${month}">← ${escapeHtml(selectedAuthor.name)}</a>` : selectedProject ? `<a class="back-link" href="/admin/projects/${selectedProject.id}?month=${month}">← ${escapeHtml(selectedProject.name)}</a>` : ""}<h1>История коммитов</h1>${selectedAuthor && repository ? `<p class="muted">${escapeHtml(selectedAuthor.name)} · ${escapeHtml(repository)}</p>` : ""}<form class="filters" method="get" action="/admin/commits">
       <select name="author" aria-label="Сотрудник"><option value="">Все авторы</option>${authors.map((person) => `<option value="${person.id}" ${person.id === author ? "selected" : ""}>${escapeHtml(person.name)}</option>`).join("")}</select>
+      <select name="project" aria-label="Продукт"><option value="">Все продукты</option>${store.projects(month).map((item) => `<option value="${item.id}" ${item.id === project ? "selected" : ""}>${escapeHtml(item.name)}</option>`).join("")}</select>
       <select name="repository" aria-label="Проект"><option value="">Все проекты</option>${repositories.map((name) => `<option value="${escapeHtml(name)}" ${name === repository ? "selected" : ""}>${escapeHtml(name)}</option>`).join("")}</select>
       <label>С <input type="date" name="from" value="${from ?? ""}"></label><label>По <input type="date" name="to" value="${to ?? ""}"></label><button>Показать</button></form>
       <p class="muted commit-hint">Под заголовком показывается описание, если оно есть в сообщении коммита или создано ботом.</p>
@@ -228,6 +297,10 @@ function dayCommitsUrl(id: number, day: string): string {
   return `/admin/commits?author=${id}&from=${day}&to=${day}`;
 }
 
+function monthPicker(month: string): string {
+  return `<form class="month-picker" method="get"><label for="month">Месяц</label><input id="month" name="month" type="month" min="2020-01" max="${currentMonth()}" value="${month}"><button>Показать</button></form>`;
+}
+
 async function loadCommitStats(store: CommitStore, missing: { repository: string; sha: string }[], token: string): Promise<void> {
   await Promise.all(missing.map(async ({ repository, sha }) => {
     const [owner, repo] = repository.split("/", 2);
@@ -255,7 +328,7 @@ function loginPage(error: boolean): string {
 
 function page(title: string, content: string, authenticated: boolean, csrf = ""): string {
   return `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)} · Manager Bot</title><style>${css}${mobileHeaderCss}${dashboardCss}${polishCss}${interactionCss}${responsiveFilterCss}${activityCss}${profileDetailCss}${monthCss}</style></head><body>
-    ${authenticated ? `<header><a class="brand" href="/admin">Manager Bot</a><nav><a href="/admin">Обзор</a><a href="/admin/people">Сотрудники</a><a href="/admin/commits">Коммиты</a><a href="/admin/import">Загрузка</a></nav><form method="post" action="/admin/logout"><input type="hidden" name="csrf" value="${csrf}"><button class="quiet" data-loading-label="Выходим…">Выйти</button></form></header>` : ""}
+    ${authenticated ? `<header><a class="brand" href="/admin">Manager Bot</a><nav><a href="/admin">Обзор</a><a href="/admin/people">Сотрудники</a><a href="/admin/projects">Проекты</a><a href="/admin/commits">Коммиты</a><a href="/admin/import">Загрузка</a></nav><form method="post" action="/admin/logout"><input type="hidden" name="csrf" value="${csrf}"><button class="quiet" data-loading-label="Выходим…">Выйти</button></form></header>` : ""}
     <main>${content}</main><script>${interactionJs}</script></body></html>`;
 }
 
@@ -267,7 +340,7 @@ const interactionCss = `.project-row{color:inherit;cursor:pointer;align-items:ce
 const responsiveFilterCss = `.commit-hint{font-size:13px;margin:-6px 0 18px}@media(max-width:600px){.filters select{width:100%;min-width:0}.filters label{flex:1 1 130px;min-width:0}.filters label input{width:100%;min-width:0}.filters button{min-width:120px}}`;
 const activityCss = `.activity-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;margin-bottom:22px}.activity-heading h2{margin-bottom:4px}.last-commit{display:flex;flex-direction:column;gap:4px;text-align:right;white-space:nowrap}.last-commit span{font-size:12px;color:#647084}.last-commit strong{font-size:16px}.activity-days{display:grid;gap:12px}.activity-day{display:grid;grid-template-columns:140px minmax(0,1fr) 64px;align-items:center;gap:14px;font-size:14px}.activity-day strong{text-align:right;font-size:16px}.activity-track{height:13px;border-radius:7px;background:#e9eef6;overflow:hidden}.activity-fill{height:100%;border-radius:7px;background:#4678db}@media(max-width:600px){.activity-heading{flex-wrap:wrap;gap:14px}.last-commit{text-align:left}.activity-day{grid-template-columns:90px minmax(0,1fr) 35px;gap:8px;font-size:12px}.activity-day strong{font-size:14px}}@media(prefers-color-scheme:dark){.last-commit span{color:#a5b4c7}.activity-track{background:#344155}.activity-fill{background:#7ca6ff}.project-row,.project-row:visited{color:#edf2f8}}`;
 const profileDetailCss = `.activity-day-link{color:inherit;border-radius:7px;margin:-3px -7px;padding:3px 7px}.activity-day-link:hover,.days-list a:hover{background:#eef3fd;text-decoration:none}.activity-day-link strong:after{content:' →';color:#305cb8}.days-detail{margin-top:20px;border-top:1px solid #e0e6ef;padding-top:12px}.days-detail summary{cursor:pointer;color:#305cb8;font-weight:600}.days-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px 24px;margin-top:12px}.days-list a{display:flex;justify-content:space-between;gap:12px;padding:8px;color:inherit;border-radius:6px}.commit-size{display:block;margin-top:5px;font-size:12px}.commit-size span:first-child{color:#247851}.commit-size span:last-child{color:#ba4b4b}.commit-size-hint{font-size:13px;margin-top:-8px}@media(max-width:600px){.days-list{grid-template-columns:1fr}}@media(prefers-color-scheme:dark){.activity-day-link:hover,.days-list a:hover{background:#263c58}.activity-day-link strong:after,.days-detail summary{color:#92b5ff}.days-detail{border-color:#334155}.commit-size span:first-child{color:#7bd8a6}.commit-size span:last-child{color:#ff9a9a}}`;
-const monthCss = `.month-picker{display:flex;align-items:end;gap:10px;margin:0 0 22px}.month-picker label{display:flex;flex-direction:column;gap:5px;font-size:13px;color:#647084}.month-picker input{min-width:170px}.month-card-label{font-size:20px!important}@media(max-width:600px){.month-picker{flex-wrap:wrap}.month-picker input{min-width:0}}@media(prefers-color-scheme:dark){.month-picker label{color:#a5b4c7}}`;
+const monthCss = `.month-picker{display:flex;align-items:end;gap:10px;margin:0 0 22px}.month-picker label{display:flex;flex-direction:column;gap:5px;font-size:13px;color:#647084}.month-picker input{min-width:170px}.month-card-label{font-size:20px!important}.project-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin-bottom:22px}.project-tile{display:flex;flex-direction:column;gap:12px;padding:20px;border:1px solid #e0e6ef;border-radius:14px;background:#fff;color:inherit}.project-tile:hover{border-color:#4678db;text-decoration:none}.project-tile strong{font-size:18px}.project-tile span{line-height:1.5}.project-tile em{font-size:12px;color:#305cb8}.project-form{display:flex;align-items:end;flex-wrap:wrap;gap:12px}.project-form label{display:flex;flex-direction:column;gap:6px;flex:1 1 220px}.project-form .wide{flex-basis:100%}.project-form input,.project-form select,.project-form textarea{width:100%}.project-form textarea{font:inherit;border:1px solid #cbd5e1;border-radius:8px;padding:10px;resize:vertical;background:#fff;color:inherit}.project-tile small{margin-top:auto}@media(max-width:600px){.month-picker{flex-wrap:wrap}.month-picker input{min-width:0}.project-grid{grid-template-columns:1fr}}@media(prefers-color-scheme:dark){.month-picker label{color:#a5b4c7}.project-tile{background:#1c2635;border-color:#334155}.project-tile:hover{border-color:#7ca6ff}.project-tile em{color:#92b5ff}.project-form textarea{background:#111827;border-color:#475569}}`;
 const interactionJs = `document.addEventListener('submit',function(event){const form=event.target;if(!(form instanceof HTMLFormElement))return;if(form.dataset.submitting==='1'){event.preventDefault();return}const button=event.submitter instanceof HTMLButtonElement?event.submitter:form.querySelector('button');if(!button)return;form.dataset.submitting='1';button.dataset.originalLabel=button.textContent||'';button.textContent=button.dataset.loadingLabel||(form.action.endsWith('/login')?'Входим…':form.method.toLowerCase()==='get'?'Показываю…':'Сохраняю…');button.classList.add('is-loading');button.setAttribute('aria-busy','true');button.disabled=true});document.addEventListener('change',function(event){const select=event.target;if(!(select instanceof HTMLSelectElement)||select.name!=='author'||!select.form||!select.form.action.endsWith('/commits'))return;const repository=select.form.elements.namedItem('repository');if(repository instanceof HTMLSelectElement)repository.value='';select.form.requestSubmit()});window.addEventListener('pageshow',function(){document.querySelectorAll('form[data-submitting="1"]').forEach(function(form){form.dataset.submitting='0';form.querySelectorAll('button.is-loading').forEach(function(button){button.textContent=button.dataset.originalLabel||button.textContent;button.disabled=false;button.classList.remove('is-loading');button.removeAttribute('aria-busy')})})});`;
 
 function getSession(request: IncomingMessage, secret: string): string | null {
