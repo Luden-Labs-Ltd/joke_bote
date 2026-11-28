@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { currentMonth, nextMonth } from "./month.js";
-import { initialProjectDescriptions, initialProjectForRepository, projectSeeds } from "./project-seeds.js";
+import { initialProjectDescriptions, initialProjectForRepository, initialTrackerSources, projectSeeds } from "./project-seeds.js";
 
 export type CommitInput = {
   repository: string;
@@ -21,7 +21,7 @@ export type CommitRow = { repository: string; sha: string; message: string; comm
 export type Repository = { full_name: string; status: string; error: string | null; updated_at: string | null; commit_count: number };
 export type AuthorActivity = { activeDays: number; repositoryCount: number; days: { day: string; commits: number }[]; repositories: { repository: string; commits: number }[]; recent: CommitRow[] };
 export type AuthorInsight = { summary: string; evidence: string[]; generated_at: string; commit_count: number };
-export type Project = { id: number; name: string; description: string; draft: string; tracker_url: string; repositories: string[]; commits: number; contributors: number; last_commit: string | null };
+export type Project = { id: number; name: string; description: string; draft: string; draft_sources: string; tracker_url: string; tracker_context: string; tracker_context_url: string; repositories: string[]; commits: number; contributors: number; last_commit: string | null };
 
 export class CommitStore {
   private db: Database.Database;
@@ -87,6 +87,10 @@ export class CommitStore {
     if (!(this.db.pragma("table_info(backfill)") as { name: string }[]).some((column) => column.name === "previous_head_sha")) {
       this.db.exec("ALTER TABLE backfill ADD COLUMN previous_head_sha TEXT");
     }
+    const projectColumns = (this.db.pragma("table_info(projects)") as { name: string }[]).map((column) => column.name);
+    for (const column of ["tracker_context", "tracker_context_url", "draft_sources"]) {
+      if (!projectColumns.includes(column)) this.db.exec(`ALTER TABLE projects ADD COLUMN ${column} TEXT NOT NULL DEFAULT ''`);
+    }
     const seed = this.db.prepare("INSERT OR IGNORE INTO projects(name, tracker_url) VALUES (?, ?)");
     for (const [name, trackerId] of projectSeeds) seed.run(name, `https://tracker.luden-labs.com/project/projects/${trackerId}/issues/`);
     if (!this.db.prepare("SELECT 1 FROM catalog_meta WHERE key = 'initial_descriptions'").get()) {
@@ -98,6 +102,17 @@ export class CommitStore {
       const describe = this.db.prepare("UPDATE projects SET description = ? WHERE name = ? AND description = '' AND draft = ''");
       for (const name of ["ship", "Enola"]) describe.run(initialProjectDescriptions[name], name);
       this.db.prepare("INSERT INTO catalog_meta(key, value) VALUES ('initial_descriptions_v2', 'done')").run();
+    }
+    if (!this.db.prepare("SELECT 1 FROM catalog_meta WHERE key = 'grounded_descriptions_v1'").get()) {
+      const source = this.db.prepare("UPDATE projects SET tracker_context = ?, tracker_context_url = ? WHERE name = ? AND tracker_context = ''");
+      for (const [name, entry] of Object.entries(initialTrackerSources)) source.run(entry.text, entry.url, name);
+      const replace = this.db.prepare("UPDATE projects SET description = ? WHERE name = ? AND description = ?");
+      replace.run(initialProjectDescriptions.Retorno, "Retorno", "Продукт с мобильным приложением, административной панелью и API. В репозитории также есть библиотека документов и отдельный интерактивный 3D-сценарий.");
+      replace.run(initialProjectDescriptions.ClinIvue, "ClinIvue", "Платформа для психологов в Израиле: помогает фиксировать наблюдения во время сессии и собирать черновик психодиагностического отчёта.");
+      const fill = this.db.prepare("UPDATE projects SET description = ? WHERE name = ? AND description = '' AND draft = ''");
+      for (const name of ["Volunteers", "BOOK OF LIFE", "invoice"]) fill.run(initialProjectDescriptions[name], name);
+      this.db.prepare("UPDATE projects SET description = ? WHERE name = 'onroter' AND description = ''").run(initialProjectDescriptions.onroter);
+      this.db.prepare("INSERT INTO catalog_meta(key, value) VALUES ('grounded_descriptions_v1', 'done')").run();
     }
     if (!this.db.prepare("SELECT 1 FROM catalog_meta WHERE key = 'initial_mapping'").get()) {
       for (const repo of this.repositories()) this.assignInitialProject(repo.full_name);
@@ -137,17 +152,18 @@ export class CommitStore {
     return Number(result.lastInsertRowid);
   }
 
-  updateProject(id: number, name: string, description: string, trackerUrl: string): void {
-    this.db.prepare("UPDATE projects SET name = ?, description = ?, tracker_url = ?, draft = '' WHERE id = ?")
-      .run(name.trim(), description.trim(), trackerUrl.trim(), id);
+  updateProject(id: number, name: string, description: string, trackerUrl: string, trackerContext?: string, trackerContextUrl?: string): void {
+    this.db.prepare("UPDATE projects SET name = ?, description = ?, tracker_url = ?, tracker_context = ?, tracker_context_url = ?, draft = '', draft_sources = '' WHERE id = ?")
+      .run(name.trim(), description.trim(), trackerUrl.trim(), trackerContext?.trim() ?? "", trackerContextUrl?.trim() ?? "", id);
   }
 
-  saveProjectDraft(id: number, draft: string): void {
-    this.db.prepare("UPDATE projects SET draft = ? WHERE id = ?").run(draft.trim(), id);
+  saveProjectDraft(id: number, draft: string, sources?: string[]): void {
+    if (sources) this.db.prepare("UPDATE projects SET draft = ?, draft_sources = ? WHERE id = ?").run(draft.trim(), JSON.stringify(sources), id);
+    else this.db.prepare("UPDATE projects SET draft = ? WHERE id = ?").run(draft.trim(), id);
   }
 
   publishProjectDraft(id: number): void {
-    this.db.prepare("UPDATE projects SET description = draft, draft = '' WHERE id = ? AND draft != ''").run(id);
+    this.db.prepare("UPDATE projects SET description = draft, draft = '', draft_sources = '' WHERE id = ? AND draft != ''").run(id);
   }
 
   assignRepository(repository: string, projectId: number | null): void {

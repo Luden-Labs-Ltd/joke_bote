@@ -70,6 +70,24 @@ test("product catalog groups repositories, keeps tracker-only projects and publi
   } finally { rmSync(folder, { recursive: true, force: true }); }
 });
 
+test("description migration replaces old generic copy and keeps manually edited projects", () => {
+  const folder = mkdtempSync(join(tmpdir(), "manager-project-migration-"));
+  try {
+    const path = join(folder, "commits.sqlite");
+    const store = new CommitStore(path);
+    const projects = store.projects("2026-11");
+    const retorno = projects.find((item) => item.name === "Retorno");
+    const voice = projects.find((item) => item.name === "Voice");
+    assert.match(retorno.description, /восстановление от зависимостей/);
+    assert.match(retorno.tracker_context, /ментором/);
+    store.updateProject(voice.id, voice.name, "Описание, написанное владельцем", voice.tracker_url, "Карточка трекера", "https://tracker.luden-labs.com/project/browse/VOICE-1/");
+    const reopened = new CommitStore(path);
+    const savedVoice = reopened.projects("2026-11").find((item) => item.id === voice.id);
+    assert.equal(savedVoice.description, "Описание, написанное владельцем");
+    assert.equal(savedVoice.tracker_context, "Карточка трекера");
+  } finally { rmSync(folder, { recursive: true, force: true }); }
+});
+
 test("commit storage deduplicates pushes, keeps authors and aggregates merged authors", () => {
   const folder = mkdtempSync(join(tmpdir(), "manager-bot-"));
   try {
